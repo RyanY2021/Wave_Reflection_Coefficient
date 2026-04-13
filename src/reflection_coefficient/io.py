@@ -1,21 +1,26 @@
 """Data loading utilities for wave probe measurements.
 
-Three sources of metadata are merged for each test:
+Three independent inputs are combined for each test:
 
-* Tank-wide constants and per-array geometry — ``experiment_data/tank_config.json``
-* Per-test varying parameters — ``experiment_data/metadata/{rw,wn}.csv``
-* Raw probe time-series — ``experiment_data/{rw,wn}/{array}/{TEST_ID}.txt``
+* **tank_config** — tank-wide constants and probe geometry (single JSON file).
+* **metadata_dir** — folder holding the per-scheme CSVs
+  (``rw.csv``, ``wn.csv``, ``js.csv``).
+* **data_dir** — folder holding the raw probe time-series files. May be flat
+  (``<data_dir>/<TEST_ID>.txt``) or contain per-scheme subfolders
+  (``<data_dir>/<scheme>/<TEST_ID>.txt``). The loader tries both.
+
+Any of the three may be overridden on the CLI. When overridden, the chosen
+path is persisted to ``~/.reflection_coefficient.json`` so subsequent runs
+pick it up automatically.
 
 Derived quantities (``k``, ``L``, ``cg``, clipping window, ...) are **not**
 stored in metadata; they are computed by downstream stages from
-``(f, water_depth, array_geometry)``. The metadata CSVs only carry what varies
-per test and cannot be derived.
+``(f, water_depth, array_geometry)``.
 """
 
 from __future__ import annotations
 
 import json
-import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
@@ -23,81 +28,132 @@ from typing import Literal
 import numpy as np
 import pandas as pd
 
-Campaign = Literal["rw", "wn", "jonswap"]
-CAMPAIGNS: tuple[str, ...] = ("rw", "wn", "jonswap")
+Campaign = Literal["rw", "wn", "js"]
+CAMPAIGNS: tuple[str, ...] = ("rw", "wn", "js")
 
 # Test-id prefix → scheme. Prefixes are matched case-insensitively.
-_PREFIX_TO_CAMPAIGN = {"RW": "rw", "WN": "wn", "JS": "jonswap"}
+_PREFIX_TO_CAMPAIGN = {"RW": "rw", "WN": "wn", "JS": "js"}
 
-DEFAULT_DATA_ROOT = Path(__file__).resolve().parents[2] / "experiment_data"
-ENV_VAR = "REFLECTION_DATA_ROOT"
+_PKG_ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_TANK_CONFIG = _PKG_ROOT / "experiment_data" / "tank_config.json"
+DEFAULT_METADATA_DIR = _PKG_ROOT / "experiment_data" / "metadata"
+DEFAULT_DATA_DIR = _PKG_ROOT / "experiment_data"
 
-EXPECTED_LAYOUT = """\
-<data_root>/
-├── tank_config.json
-├── metadata/
-│   ├── rw.csv        # regular waves
-│   ├── wn.csv        # pure white-noise (flat PSD) irregular waves
-│   └── jonswap.csv   # JONSWAP irregular waves
-├── rw/<array>/RW###.txt
-├── wn/<array>/WN###.txt
-└── jonswap/<array>/JS###.txt
-(<array> is any subfolder name you use for a probe-array position.)
-"""
+USER_CONFIG_PATH = Path.home() / ".reflection_coefficient.json"
+
+_PATH_KEYS = ("tank_config", "metadata_dir", "data_dir")
 
 
-def resolve_data_root(explicit: Path | str | None = None) -> Path:
-    """Pick the data root in priority order: argument → env var → default.
+# ---------------------------------------------------------------------------
+# User-level config persistence
+# ---------------------------------------------------------------------------
 
-    Raises ``FileNotFoundError`` with the expected layout if none of the
-    candidates exist or the chosen path is missing the scaffolding.
-    """
+
+def _load_user_config() -> dict:
+    if not USER_CONFIG_PATH.exists():
+        return {}
+    try:
+        with open(USER_CONFIG_PATH) as f:
+            return json.load(f) or {}
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def _save_user_config(cfg: dict) -> None:
+    USER_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(USER_CONFIG_PATH, "w") as f:
+        json.dump(cfg, f, indent=2)
+
+
+def save_paths(
+    tank_config: Path | str | None = None,
+    metadata_dir: Path | str | None = None,
+    data_dir: Path | str | None = None,
+) -> None:
+    """Persist any of the three paths the user provided. ``None`` = leave alone."""
+    cfg = _load_user_config()
+    for key, value in zip(_PATH_KEYS, (tank_config, metadata_dir, data_dir)):
+        if value is not None:
+            cfg[key] = str(Path(value).resolve())
+    _save_user_config(cfg)
+
+
+def _resolve(key: str, explicit: Path | str | None, default: Path) -> Path:
     if explicit is not None:
-        root = Path(explicit)
-    elif os.environ.get(ENV_VAR):
-        root = Path(os.environ[ENV_VAR])
-    else:
-        root = DEFAULT_DATA_ROOT
-
-    if not root.exists():
-        raise FileNotFoundError(
-            f"Data root {root} does not exist.\n"
-            f"Pass --data-root, set ${ENV_VAR}, or place data at the default "
-            f"location.\nExpected layout:\n{EXPECTED_LAYOUT}"
-        )
-    return root
+        return Path(explicit)
+    stored = _load_user_config().get(key)
+    return Path(stored) if stored else default
 
 
-def validate_data_root(data_root: Path | str) -> None:
-    """Verify that ``data_root`` matches the expected scheme. Raise on mismatch."""
-    root = Path(data_root)
-    required = [
-        root / "tank_config.json",
-        *(root / "metadata" / f"{c}.csv" for c in CAMPAIGNS),
-    ]
-    missing = [str(p) for p in required if not p.exists()]
-    if missing:
-        raise FileNotFoundError(
-            "Data root is missing expected files:\n  "
-            + "\n  ".join(missing)
-            + f"\nExpected layout:\n{EXPECTED_LAYOUT}"
-        )
+def resolve_tank_config(explicit: Path | str | None = None) -> Path:
+    return _resolve("tank_config", explicit, DEFAULT_TANK_CONFIG)
+
+
+def resolve_metadata_dir(explicit: Path | str | None = None) -> Path:
+    return _resolve("metadata_dir", explicit, DEFAULT_METADATA_DIR)
+
+
+def resolve_data_dir(explicit: Path | str | None = None) -> Path:
+    return _resolve("data_dir", explicit, DEFAULT_DATA_DIR)
+
+
+# ---------------------------------------------------------------------------
+# Loading
+# ---------------------------------------------------------------------------
+
+
+def load_tank_config(path: Path | str | None = None) -> dict:
+    p = resolve_tank_config(path)
+    with open(p) as f:
+        return json.load(f)
+
+
+def load_metadata(
+    campaign: Campaign, metadata_dir: Path | str | None = None
+) -> pd.DataFrame:
+    """Return the per-test metadata table for a campaign, indexed by test_id."""
+    d = resolve_metadata_dir(metadata_dir)
+    return pd.read_csv(d / f"{campaign}.csv").set_index("test_id")
+
+
+def _data_file(data_dir: Path, campaign: Campaign, test_id: str) -> Path:
+    """Locate ``<TEST_ID>.txt`` under data_dir/scheme/ or data_dir/ (flat)."""
+    with_scheme = data_dir / campaign / f"{test_id}.txt"
+    if with_scheme.exists():
+        return with_scheme
+    flat = data_dir / f"{test_id}.txt"
+    if flat.exists():
+        return flat
+    raise FileNotFoundError(
+        f"{test_id}.txt not found under {data_dir} "
+        f"(tried {with_scheme} and {flat})"
+    )
 
 
 def list_tests(
     campaign: Campaign,
-    array: str,
-    data_root: Path | str | None = None,
+    data_dir: Path | str | None = None,
+    metadata_dir: Path | str | None = None,
 ) -> list[str]:
     """Return test ids for which both a data file and a metadata row exist."""
-    root = resolve_data_root(data_root)
-    data_dir = root / campaign / array
-    if not data_dir.is_dir():
-        return []
+    d = resolve_data_dir(data_dir)
     prefix = next(p for p, c in _PREFIX_TO_CAMPAIGN.items() if c == campaign)
-    on_disk = {p.stem for p in data_dir.glob(f"{prefix}*.txt")}
-    in_matrix = set(load_metadata(campaign, root).index)
-    return sorted(on_disk & in_matrix)
+    candidates: set[str] = set()
+    sub = d / campaign
+    if sub.is_dir():
+        candidates.update(p.stem for p in sub.glob(f"{prefix}*.txt"))
+    if d.is_dir():
+        candidates.update(p.stem for p in d.glob(f"{prefix}*.txt"))
+    try:
+        in_matrix = set(load_metadata(campaign, metadata_dir).index)
+    except FileNotFoundError:
+        in_matrix = set()
+    return sorted(candidates & in_matrix)
+
+
+# ---------------------------------------------------------------------------
+# TestMeta
+# ---------------------------------------------------------------------------
 
 
 @dataclass
@@ -106,7 +162,6 @@ class TestMeta:
 
     test_id: str
     campaign: Campaign
-    array: str
 
     # Tank-wide (from tank_config.json)
     water_depth_m: float
@@ -150,21 +205,6 @@ class TestMeta:
     extra: dict = field(default_factory=dict)
 
 
-def load_tank_config(data_root: Path | str | None = None) -> dict:
-    root = resolve_data_root(data_root)
-    with open(root / "tank_config.json") as f:
-        return json.load(f)
-
-
-def load_metadata(
-    campaign: Campaign, data_root: Path | str | None = None
-) -> pd.DataFrame:
-    """Return the per-test metadata table for a campaign, indexed by test_id."""
-    root = resolve_data_root(data_root)
-    path = root / "metadata" / f"{campaign}.csv"
-    return pd.read_csv(path).set_index("test_id")
-
-
 _KNOWN_META_COLUMNS = {
     "t_gen_s", "notes",
     "f_Hz", "a_target_m",
@@ -177,7 +217,6 @@ _KNOWN_META_COLUMNS = {
 def _build_meta(
     test_id: str,
     campaign: Campaign,
-    array: str,
     config: dict,
     row: pd.Series,
 ) -> TestMeta:
@@ -187,7 +226,6 @@ def _build_meta(
     return TestMeta(
         test_id=test_id,
         campaign=campaign,
-        array=array,
         water_depth_m=tank["water_depth_m"],
         gravity_m_s2=tank["gravity_m_s2"],
         tank_length_m=geom.get("tank_length_m"),
@@ -210,15 +248,18 @@ def _build_meta(
 
 def load_probe_data(
     test_id: str,
-    array: str,
     campaign: Campaign | None = None,
-    data_root: Path | str | None = None,
+    tank_config: Path | str | None = None,
+    metadata_dir: Path | str | None = None,
+    data_dir: Path | str | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, TestMeta]:
     """Load one test's elevations (m) plus metadata.
 
     Returns ``(t, eta1, eta2, eta3, meta)`` where ``eta1`` is the probe nearest
     the wave maker and ``eta3`` the probe nearest the structure. Campaign is
-    inferred from the test id prefix when not given.
+    inferred from the test id prefix when not given. Any of ``tank_config``,
+    ``metadata_dir``, ``data_dir`` may be overridden; otherwise the stored
+    user-config value or built-in default is used.
     """
     if campaign is None:
         up = test_id.upper()
@@ -232,8 +273,7 @@ def load_probe_data(
                 f"Known prefixes: {sorted(_PREFIX_TO_CAMPAIGN)}"
             )
 
-    data_root = resolve_data_root(data_root)
-    path = data_root / campaign / array / f"{test_id}.txt"
+    path = _data_file(resolve_data_dir(data_dir), campaign, test_id)
 
     # Tab-separated; two header rows (names, units). On-disk column order is
     # time, keyboard, wp3, wp2, wp1 — note wp3 precedes wp1.
@@ -252,10 +292,10 @@ def load_probe_data(
     eta2 = df["wp2"].to_numpy(dtype=float) / 1000.0
     eta3 = df["wp3"].to_numpy(dtype=float) / 1000.0
 
-    config = load_tank_config(data_root)
-    table = load_metadata(campaign, data_root)
+    config = load_tank_config(tank_config)
+    table = load_metadata(campaign, metadata_dir)
     if test_id not in table.index:
-        raise KeyError(f"{test_id} not found in metadata/{campaign}.csv")
-    meta = _build_meta(test_id, campaign, array, config, table.loc[test_id])
+        raise KeyError(f"{test_id} not found in {campaign}.csv")
+    meta = _build_meta(test_id, campaign, config, table.loc[test_id])
 
     return t, eta1, eta2, eta3, meta

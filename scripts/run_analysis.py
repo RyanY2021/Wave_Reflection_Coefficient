@@ -1,36 +1,39 @@
 """Command-line entry point for reflection coefficient analysis.
 
-Each run must declare three things up front so it is unambiguous whether the
-analysis is for regular or irregular waves, and against which probe array:
+Three path inputs can be overridden independently (each is remembered in
+``~/.reflection_coefficient.json`` the next time you supply it):
 
-* **scheme**   — ``rw`` (regular wave) or ``wn`` (irregular / white-noise)
-* **array**    — ``middle_tank`` or ``near_beach``
-* **data root** — folder containing ``tank_config.json``, ``metadata/`` and the
-  ``{rw,wn}/{middle_tank,near_beach}/`` data directories
+* ``--tank-config``   — path to the tank_config.json file
+* ``--metadata-dir``  — folder containing rw.csv / wn.csv / js.csv
+* ``--data-dir``      — folder holding raw ``<TEST_ID>.txt`` files
+                        (flat or with per-scheme subfolders)
 
-Any of the three may be supplied on the command line; anything omitted is
-prompted for interactively so no run can start without explicit scheme
-selection.
+The only mandatory per-run choice is the wave scheme (``rw`` / ``wn`` / ``js``),
+which is prompted for if ``--scheme`` is omitted.
 """
 
 from __future__ import annotations
 
 import argparse
+import csv
 import sys
 from pathlib import Path
 
 from reflection_coefficient.io import (
-    ENV_VAR,
+    USER_CONFIG_PATH,
     list_tests,
     load_probe_data,
-    resolve_data_root,
-    validate_data_root,
+    resolve_data_dir,
+    resolve_metadata_dir,
+    resolve_tank_config,
+    save_paths,
 )
+from reflection_coefficient.pipeline import IrregularResult, RegularResult, analyse
 
 SCHEME_LABELS = {
     "rw": "REGULAR WAVE",
     "wn": "WHITE-NOISE IRREGULAR WAVE",
-    "jonswap": "JONSWAP IRREGULAR WAVE",
+    "js": "JONSWAP IRREGULAR WAVE",
 }
 
 
@@ -45,56 +48,29 @@ def _prompt_choice(question: str, choices: tuple[str, ...]) -> str:
         print(f"Please enter one of {choices} or 1..{len(choices)}.")
 
 
-def _resolve_selection(args: argparse.Namespace) -> tuple[Path, str, str]:
-    # Data root first, because the error message it produces is the most
-    # useful signal if the user's path is wrong.
-    try:
-        data_root = resolve_data_root(args.data_root)
-        validate_data_root(data_root)
-    except FileNotFoundError as exc:
-        print(exc, file=sys.stderr)
-        sys.exit(1)
-
-    scheme = args.scheme or _prompt_choice(
-        "Select wave scheme for this run:", ("rw", "wn", "jonswap")
-    )
-    array = args.array or _prompt_array(data_root, scheme)
-    return data_root, scheme, array
-
-
-def _prompt_array(data_root: Path, scheme: str) -> str:
-    campaign_dir = data_root / scheme
-    found = sorted(p.name for p in campaign_dir.iterdir() if p.is_dir()) \
-        if campaign_dir.is_dir() else []
-    if not found:
-        raise SystemExit(
-            f"No probe-array subfolders found under {campaign_dir}. "
-            "Create one (any name) and place your test .txt files in it."
-        )
-    return _prompt_choice("Select probe array folder:", tuple(found))
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Compute wave tank reflection coefficient.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
-        "--data-root", type=Path, default=None,
+        "--tank-config", type=Path, default=None,
+        help=f"Tank config JSON file. Persisted in {USER_CONFIG_PATH} when set.",
+    )
+    parser.add_argument(
+        "--metadata-dir", type=Path, default=None,
+        help="Folder with rw.csv / wn.csv / js.csv. Persisted when set.",
+    )
+    parser.add_argument(
+        "--data-dir", type=Path, default=None,
         help=(
-            f"Root of the experiment_data tree. Falls back to ${ENV_VAR} then "
-            "the in-repo default."
+            "Folder containing raw <TEST_ID>.txt files (flat or with "
+            "rw/wn/js subfolders). Persisted when set."
         ),
     )
     parser.add_argument(
-        "--scheme", choices=["rw", "wn", "jonswap"], default=None,
-        help="Wave scheme: 'rw' = regular wave, 'wn' = white-noise irregular, "
-             "'jonswap' = JONSWAP irregular. Prompted if omitted.",
-    )
-    parser.add_argument(
-        "--array", default=None,
-        help="Name of the probe-array subfolder under <data_root>/<scheme>/. "
-             "Prompted from the available folders if omitted.",
+        "--scheme", choices=["rw", "wn", "js"], default=None,
+        help="Wave scheme (rw/wn/js). Prompted if omitted.",
     )
     parser.add_argument(
         "--test", default="all",
@@ -104,19 +80,53 @@ def main() -> None:
     parser.add_argument("--method", choices=["goda", "least_squares"], default="least_squares")
     parser.add_argument(
         "--list", action="store_true",
-        help="List tests discovered under the chosen data root and exit.",
+        help="List tests discovered for the chosen scheme and exit.",
+    )
+    parser.add_argument(
+        "--show-paths", action="store_true",
+        help="Print the resolved tank_config / metadata_dir / data_dir and exit.",
     )
     args = parser.parse_args()
 
-    data_root, scheme, array = _resolve_selection(args)
+    # Persist any explicitly provided paths before resolving (so the saved
+    # values are available to later invocations regardless of errors below).
+    if any(v is not None for v in (args.tank_config, args.metadata_dir, args.data_dir)):
+        save_paths(
+            tank_config=args.tank_config,
+            metadata_dir=args.metadata_dir,
+            data_dir=args.data_dir,
+        )
+        print(f"[run_analysis] updated saved paths in {USER_CONFIG_PATH}")
 
-    banner = f" {SCHEME_LABELS[scheme]} | array={array} | root={data_root} "
+    tank_cfg = resolve_tank_config(args.tank_config)
+    meta_dir = resolve_metadata_dir(args.metadata_dir)
+    data_dir = resolve_data_dir(args.data_dir)
+
+    if args.show_paths:
+        print(f"  tank_config  = {tank_cfg}")
+        print(f"  metadata_dir = {meta_dir}")
+        print(f"  data_dir     = {data_dir}")
+        return
+
+    for label, p in [("tank_config", tank_cfg), ("metadata_dir", meta_dir), ("data_dir", data_dir)]:
+        if not p.exists():
+            print(f"[run_analysis] {label} does not exist: {p}", file=sys.stderr)
+            sys.exit(1)
+
+    scheme = args.scheme or _prompt_choice(
+        "Select wave scheme for this run:", ("rw", "wn", "js")
+    )
+
+    banner = (
+        f" {SCHEME_LABELS[scheme]} | data_dir={data_dir} "
+        f"| metadata_dir={meta_dir} "
+    )
     print("=" * len(banner))
     print(banner)
     print("=" * len(banner))
 
-    available = list_tests(scheme, array, data_root)
-    print(f"[run_analysis] {len(available)} test(s) found for {scheme}/{array}")
+    available = list_tests(scheme, data_dir=data_dir, metadata_dir=meta_dir)
+    print(f"[run_analysis] {len(available)} test(s) found for {scheme}")
 
     if args.list:
         for tid in available:
@@ -128,16 +138,83 @@ def main() -> None:
     elif args.test in available:
         selected = [args.test]
     else:
-        print(f"Test {args.test!r} not found under {data_root}.", file=sys.stderr)
+        print(f"Test {args.test!r} not found under {data_dir}.", file=sys.stderr)
         sys.exit(2)
 
     args.output.mkdir(parents=True, exist_ok=True)
+    regular_results: list[RegularResult] = []
     for tid in selected:
         t, eta1, eta2, eta3, meta = load_probe_data(
-            tid, array=array, campaign=scheme, data_root=data_root,
+            tid, campaign=scheme,
+            tank_config=tank_cfg, metadata_dir=meta_dir, data_dir=data_dir,
         )
         print(f"[run_analysis] {tid}: N={len(t)}, fs≈{1/(t[1]-t[0]):.1f} Hz")
-        # TODO: wire up preprocessing -> method -> save results
+        try:
+            result = analyse(t, eta1, eta2, eta3, meta, method=args.method)
+        except Exception as exc:
+            print(f"  !! {tid}: {exc}", file=sys.stderr)
+            continue
+        _report(result)
+        if isinstance(result, RegularResult):
+            regular_results.append(result)
+
+    if scheme == "rw" and len(regular_results) >= 2:
+        _write_kr_vs_freq(regular_results, args.output, args.method)
+
+
+def _report(result: RegularResult | IrregularResult) -> None:
+    if isinstance(result, RegularResult):
+        print(
+            f"  {result.test_id} [{result.method}] "
+            f"f={result.f_Hz:.3f} Hz  H_I={result.H_I:.4f} m  "
+            f"H_R={result.H_R:.4f} m  Kr={result.Kr:.3f}"
+            + ("" if result.singularity_ok else "  [SINGULARITY]")
+        )
+    else:
+        d = result.diagnostics
+        print(
+            f"  {result.test_id} [{result.method}] "
+            f"Hm0_I={result.Hm0_I:.4f} m  Hm0_R={result.Hm0_R:.4f} m  "
+            f"Tp_I={result.Tp_I:.3f} s  Kr={result.Kr_overall:.3f}  "
+            f"(bins={d['n_bins_valid']}, min D/sin²={d['D_or_sin2_min']:.3f})"
+        )
+
+
+def _write_kr_vs_freq(results: list[RegularResult], out_dir: Path, method: str) -> None:
+    """Aggregate regular-wave runs into a Kr(f) table (+ plot if matplotlib)."""
+    rows = sorted(results, key=lambda r: r.f_Hz)
+    csv_path = out_dir / f"rw_kr_vs_freq_{method}.csv"
+    with csv_path.open("w", newline="") as fh:
+        w = csv.writer(fh)
+        w.writerow(["test_id", "f_Hz", "k_rad_m", "L_m", "H_I_m", "H_R_m", "Kr", "singularity_ok"])
+        for r in rows:
+            w.writerow([
+                r.test_id, f"{r.f_Hz:.6f}", f"{r.k:.6f}", f"{r.wavelength_m:.6f}",
+                f"{r.H_I:.6f}", f"{r.H_R:.6f}", f"{r.Kr:.6f}", int(r.singularity_ok),
+            ])
+    print(f"[run_analysis] wrote {csv_path}")
+
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError:
+        return
+    fig, ax = plt.subplots(figsize=(6, 4))
+    fs = [r.f_Hz for r in rows]
+    krs = [r.Kr for r in rows]
+    ax.plot(fs, krs, marker="o", linestyle="-")
+    for r in rows:
+        if not r.singularity_ok:
+            ax.plot([r.f_Hz], [r.Kr], marker="x", color="red")
+    ax.set_xlabel("f [Hz]")
+    ax.set_ylabel(r"$K_r$")
+    ax.set_title(f"Regular-wave reflection coefficient ({method})")
+    ax.grid(True, alpha=0.3)
+    ax.set_ylim(bottom=0)
+    png_path = out_dir / f"rw_kr_vs_freq_{method}.png"
+    fig.tight_layout()
+    fig.savefig(png_path, dpi=150)
+    plt.close(fig)
+    print(f"[run_analysis] wrote {png_path}")
 
 
 if __name__ == "__main__":
