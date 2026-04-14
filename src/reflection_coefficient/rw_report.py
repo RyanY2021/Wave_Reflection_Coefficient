@@ -11,9 +11,9 @@ for tank geometry, and optional paths to the CSV / PNG generated alongside.
 
 from __future__ import annotations
 
-import base64
 import csv
 import html
+import json
 import math
 from pathlib import Path
 
@@ -74,6 +74,16 @@ def _status_colors(status: str) -> tuple[str, str]:
     return "var(--color-background-danger)", "#A32D2D"
 
 
+CHARTJS_CDN = "https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"
+
+_CHART_DEFAULTS = (
+    "if(window.Chart){"
+    "Chart.defaults.font.family=getComputedStyle(document.body).fontFamily;"
+    "Chart.defaults.color=getComputedStyle(document.body).color;"
+    "Chart.defaults.borderColor=getComputedStyle(document.body).getPropertyValue('--color-border-tertiary');"
+    "}"
+)
+
 _CSS = """
 :root {
   --color-background-primary:#ffffff;--color-background-secondary:#f5f5f2;
@@ -81,7 +91,7 @@ _CSS = """
   --color-background-danger:#FCEBEB;--color-text-primary:#1a1a1a;
   --color-text-secondary:#5f5e5a;--color-border-tertiary:rgba(0,0,0,0.15);
   --color-border-secondary:rgba(0,0,0,0.3);
-  --font-sans:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;
+  --font-sans:'Galaxie Copernicus','Copernicus',Georgia,'Times New Roman',serif;
   --font-mono:'SF Mono','Consolas','Courier New',monospace;
   --border-radius-md:8px;--border-radius-lg:12px;
 }
@@ -204,59 +214,21 @@ def _table(rows: list[dict]) -> str:
     )
 
 
-def _gantt_png(rows: list[dict]) -> str:
-    """Return an <img> tag with a base64-embedded Gantt chart of time windows.
-
-    Mirrors the Chart.js visual in ``docs/rw_test_matrix/*.html``: per frequency
-    a grey 'wait-for-reflection' bar from 0→t_start and a coloured 'usable'
-    bar from t_start→t_end, with dashed vertical t_gen limit(s).
-    """
-    try:
-        import io as _io
-        import matplotlib.pyplot as plt
-    except ImportError:
-        return ""
+def _gantt_canvas(rows: list[dict]) -> str:
+    """Interactive Gantt chart of per-test time windows (Chart.js)."""
     if not rows:
         return ""
-
-    labels = [f"{r['f']:.2f}" for r in rows]
-    y = list(range(len(rows)))
-    fig_h = max(3.0, 0.28 * len(rows) + 1.2)
-    fig, ax = plt.subplots(figsize=(8.5, fig_h))
-
-    for i, r in enumerate(rows):
-        if r["t_use"] <= 0:
-            continue
-        ax.barh(i, r["t_start"], left=0,
-                color=(136/255, 135/255, 128/255, 0.2),
-                edgecolor=(136/255, 135/255, 128/255, 0.4), linewidth=0.5)
-        clamped = r["status"].startswith("CLAMPED")
-        face = (186/255, 117/255, 23/255, 0.45) if clamped else (50/255, 102/255, 173/255, 0.45)
-        edge = "#BA7517" if clamped else "#3266ad"
-        ax.barh(i, r["t_end"] - r["t_start"], left=r["t_start"],
-                color=face, edgecolor=edge, linewidth=0.8)
-
-    t_gens = sorted({r["t_gen"] for r in rows if r["t_gen"] is not None})
-    colors = {180: "#E24B4A", 240: "#534AB7"}
-    for tg in t_gens:
-        ax.axvline(tg, linestyle="--", linewidth=1.3,
-                   color=colors.get(int(tg), "#888"))
-        ax.text(tg, -0.8, f"{tg:g}s", color=colors.get(int(tg), "#888"),
-                fontsize=9, ha="center")
-
-    ax.set_yticks(y)
-    ax.set_yticklabels(labels, fontsize=9)
-    ax.invert_yaxis()
-    ax.set_xlabel("Time (s)")
-    ax.set_ylabel("Frequency (Hz)")
-    ax.set_xlim(0, max([r["t_end"] for r in rows] + t_gens + [1.0]) * 1.05)
-    ax.grid(True, axis="x", alpha=0.25)
-    fig.tight_layout()
-
-    buf = _io.BytesIO()
-    fig.savefig(buf, format="png", dpi=140)
-    plt.close(fig)
-    data = base64.b64encode(buf.getvalue()).decode("ascii")
+    data = [
+        {
+            "f": r["f"], "t_gen": r["t_gen"],
+            "t_start": r["t_start"], "t_end": r["t_end"],
+            "t_use": r["t_use"], "n_per": r["n_per"],
+            "status": r["status"],
+        }
+        for r in rows
+    ]
+    payload = json.dumps(data)
+    height = max(320, 22 * len(rows) + 80)
     legend = (
         '<div style="display:flex;flex-wrap:wrap;gap:16px;margin:8px 0 0;'
         'font-size:12px;color:var(--color-text-secondary);">'
@@ -272,22 +244,124 @@ def _gantt_png(rows: list[dict]) -> str:
         'background:#534AB7;margin-right:4px;"></span>240 s limit</span>'
         '</div>'
     )
-    return (
-        f'<img src="data:image/png;base64,{data}" alt="Time window Gantt" '
-        f'style="max-width:100%;height:auto;border-radius:var(--border-radius-md);'
-        f'background:var(--color-background-secondary);padding:0.5rem;"/>{legend}'
-    )
+    return f"""
+<div style="position:relative;width:100%;height:{height}px;
+     background:var(--color-background-secondary);
+     border-radius:var(--border-radius-md);padding:0.75rem;">
+  <canvas id="ganttChart"></canvas>
+</div>{legend}
+<script>(function(){{
+  const rows = {payload};
+  const labels = rows.map(r => r.f.toFixed(2));
+  const waitData = rows.map(r => r.t_use > 0 ? [0, r.t_start] : null);
+  const useData  = rows.map(r => r.t_use > 0 ? [r.t_start, r.t_end] : null);
+  const useFills = rows.map(r => r.status.startsWith('OK') ? 'rgba(50,102,173,0.45)' : 'rgba(186,117,23,0.45)');
+  const useEdges = rows.map(r => r.status.startsWith('OK') ? '#3266ad' : '#BA7517');
+  const tGens = Array.from(new Set(rows.map(r => r.t_gen).filter(v => v!=null))).sort((a,b)=>a-b);
+  const limitColors = {{180:'#E24B4A', 240:'#534AB7'}};
+  const maxX = Math.max(...rows.map(r=>r.t_end||0), ...tGens, 1) * 1.05;
+  new Chart(document.getElementById('ganttChart'), {{
+    type:'bar',
+    data:{{labels, datasets:[
+      {{label:'Wait', data:waitData,
+        backgroundColor:'rgba(136,135,128,0.2)', borderColor:'rgba(136,135,128,0.4)',
+        borderWidth:1, borderSkipped:false}},
+      {{label:'Usable', data:useData, backgroundColor:useFills, borderColor:useEdges,
+        borderWidth:1, borderSkipped:false}}
+    ]}},
+    options:{{
+      responsive:true, maintainAspectRatio:false, indexAxis:'y',
+      plugins:{{
+        legend:{{display:false}},
+        tooltip:{{callbacks:{{
+          title:(items)=>'f = '+items[0].label+' Hz',
+          label:(ctx)=>{{
+            const r = rows[ctx.dataIndex];
+            if(!ctx.raw) return ctx.dataset.label+': —';
+            const [a,b] = ctx.raw;
+            if(ctx.dataset.label==='Usable')
+              return ['Usable: '+a.toFixed(1)+' → '+b.toFixed(1)+' s',
+                      'T_use = '+r.t_use.toFixed(1)+' s  ('+r.n_per.toFixed(1)+' periods)',
+                      'Status: '+r.status];
+            return 'Wait: 0 → '+b.toFixed(1)+' s';
+          }}
+        }}}}
+      }},
+      scales:{{
+        x:{{title:{{display:true,text:'Time (s)'}}, min:0, max:maxX}},
+        y:{{title:{{display:true,text:'Frequency (Hz)'}}, ticks:{{autoSkip:false, font:{{size:11}}}}}}
+      }}
+    }},
+    plugins:[{{
+      id:'tGenLimits',
+      afterDraw(chart){{
+        const ctx = chart.ctx, xS = chart.scales.x, area = chart.chartArea;
+        tGens.forEach(v => {{
+          const x = xS.getPixelForValue(v);
+          ctx.save();
+          ctx.strokeStyle = limitColors[v] || '#888';
+          ctx.lineWidth = 1.5; ctx.setLineDash([5,3]);
+          ctx.beginPath(); ctx.moveTo(x, area.top); ctx.lineTo(x, area.bottom); ctx.stroke();
+          ctx.restore();
+          ctx.fillStyle = limitColors[v] || '#888';
+          ctx.font = '10px ' + getComputedStyle(document.body).fontFamily;
+          ctx.fillText(v+' s', x+4, area.top+10);
+        }});
+      }}
+    }}]
+  }});
+}})();</script>
+"""
 
 
-def _embedded_png(png_path: Path | None) -> str:
-    if png_path is None or not png_path.exists():
-        return '<p style="color:var(--color-text-secondary);">(no curve image available)</p>'
-    data = base64.b64encode(png_path.read_bytes()).decode("ascii")
-    return (
-        f'<img src="data:image/png;base64,{data}" alt="Kr vs frequency" '
-        f'style="max-width:100%;height:auto;border-radius:var(--border-radius-md);'
-        f'background:var(--color-background-secondary);padding:0.5rem;"/>'
-    )
+def _kr_chart_canvas(rows: list[dict]) -> str:
+    """Interactive Kr-vs-f line chart."""
+    data = [
+        {"f": r["f"], "Kr": r["Kr"], "ok": bool(r["singularity_ok"]),
+         "test_id": r["test_id"], "H_I": r["H_I"], "H_R": r["H_R"]}
+        for r in rows
+    ]
+    payload = json.dumps(data)
+    return f"""
+<div style="position:relative;width:100%;height:420px;
+     background:var(--color-background-secondary);
+     border-radius:var(--border-radius-md);padding:0.75rem;">
+  <canvas id="krChart"></canvas>
+</div>
+<script>(function(){{
+  const rows = {payload};
+  const points = rows.map(r => ({{x:r.f, y:r.Kr}}));
+  const flagged = rows.filter(r => !r.ok).map(r => ({{x:r.f, y:r.Kr}}));
+  new Chart(document.getElementById('krChart'), {{
+    type:'line',
+    data:{{datasets:[
+      {{label:'K_r', data:points, borderColor:'#3266ad', backgroundColor:'#3266ad',
+        pointRadius:4, pointHoverRadius:6, tension:0.1, fill:false}},
+      {{label:'Singularity flagged', data:flagged, type:'scatter',
+        borderColor:'#A32D2D', backgroundColor:'#A32D2D',
+        pointStyle:'crossRot', pointRadius:8, pointHoverRadius:10, showLine:false}}
+    ]}},
+    options:{{
+      responsive:true, maintainAspectRatio:false,
+      plugins:{{
+        legend:{{labels:{{boxWidth:12}}}},
+        tooltip:{{callbacks:{{
+          label:(ctx)=>{{
+            const r = rows[ctx.dataIndex];
+            return [r.test_id+':  K_r = '+r.Kr.toFixed(3),
+                    'H_I = '+r.H_I.toFixed(4)+' m,  H_R = '+r.H_R.toFixed(4)+' m',
+                    r.ok ? '' : '⚠ singularity flagged'].filter(Boolean);
+          }}
+        }}}}
+      }},
+      scales:{{
+        x:{{type:'linear', title:{{display:true,text:'f (Hz)'}}}},
+        y:{{title:{{display:true,text:'K_r'}}, beginAtZero:true}}
+      }}
+    }}
+  }});
+}})();</script>
+"""
 
 
 def _csv_block(csv_path: Path | None) -> str:
@@ -363,9 +437,9 @@ def write_rw_report(
         "<h2>Per-test time window & reflection</h2>",
         _table(rows),
         "<h2>Time-window breakdown</h2>",
-        _gantt_png(rows),
+        _gantt_canvas(rows),
         "<h2>K<sub>r</sub> vs frequency</h2>",
-        _embedded_png(png_path),
+        _kr_chart_canvas(rows),
         "<h2>Result CSV</h2>",
         _csv_block(csv_path),
     ])
@@ -374,7 +448,11 @@ def write_rw_report(
         '<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">'
         '<meta name="viewport" content="width=device-width,initial-scale=1.0">'
         f'<title>RW reflection report ({html.escape(method)})</title>'
-        f'<style>{_CSS}</style></head><body>{body}</body></html>'
+        f'<style>{_CSS}</style>'
+        f'<script src="{CHARTJS_CDN}"></script>'
+        f'</head><body>'
+        f'<script>{_CHART_DEFAULTS}</script>'
+        f'{body}</body></html>'
     )
     out_path = out_dir / f"rw_report_{method}.html"
     out_path.write_text(html_doc, encoding="utf-8")

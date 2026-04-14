@@ -6,30 +6,32 @@ the HTML is keyed to a single ``IrregularResult`` + its ``TestMeta``.
 
 Outputs written to ``out_dir``:
 
-* ``<test_id>_spectra_<method>.png`` — incident vs reflected spectral density
-* ``<test_id>_kr_f_<method>.png``   — Kr(f) across the analysis band
-* ``<test_id>_singularity_<method>.png`` — D or sin²(kΔ) vs f
-* ``<test_id>_spectrum_<method>.csv`` — smoothed S_I, S_R, Kr(f) table
-* ``<test_id>_report_<method>.html`` — self-contained report
+* ``<test_id>_<method>_spectrum.csv`` — smoothed S_I, S_R, Kr(f) table
+* ``<test_id>_<method>_report.html`` — self-contained report with
+  interactive Chart.js plots (spectra, Kr(f), singularity metric).
 """
 
 from __future__ import annotations
 
-import base64
 import csv
 import html
-import io as _io
-import math
+import json
 from pathlib import Path
 
 import numpy as np
 
-from .analysis import group_velocity, solve_dispersion
+from .analysis import group_velocity, solve_dispersion, solve_dispersion_array
 from .io import TestMeta
 from .pipeline import IrregularResult, clip_bounds
 
-# Re-use the stylesheet + tank SVG + geometry cards from rw_report.
-from .rw_report import _CSS, _geometry_cards, _tank_svg  # noqa: F401
+# Re-use the stylesheet + tank SVG + geometry cards + chart bootstrap from rw_report.
+from .rw_report import (  # noqa: F401
+    CHARTJS_CDN,
+    _CHART_DEFAULTS,
+    _CSS,
+    _geometry_cards,
+    _tank_svg,
+)
 
 
 def _window_info(result: IrregularResult, meta: TestMeta) -> dict:
@@ -54,92 +56,197 @@ def _window_info(result: IrregularResult, meta: TestMeta) -> dict:
     }
 
 
-def _png_b64(fig) -> str:
-    import matplotlib.pyplot as plt
-    buf = _io.BytesIO()
-    fig.tight_layout()
-    fig.savefig(buf, format="png", dpi=140)
-    plt.close(fig)
-    return base64.b64encode(buf.getvalue()).decode("ascii")
+def _chart_wrap(canvas_id: str, height_px: int, inner_script: str) -> str:
+    return (
+        f'<div style="position:relative;width:100%;height:{height_px}px;'
+        f'background:var(--color-background-secondary);'
+        f'border-radius:var(--border-radius-md);padding:0.75rem;">'
+        f'<canvas id="{canvas_id}"></canvas></div>'
+        f'<script>{inner_script}</script>'
+    )
 
 
-def _plot_spectra(result: IrregularResult, win: dict, out_path: Path) -> str:
-    import matplotlib.pyplot as plt
-    f = result.f_smooth
-    fig, ax = plt.subplots(figsize=(7, 4))
-    ax.plot(f, result.S_I_smooth, label="Incident $S_I$", color="#3266ad")
-    ax.plot(f, result.S_R_smooth, label="Reflected $S_R$", color="#D85A30")
-    ax.axvspan(win["f_lo"], win["f_hi"], color="#3266ad", alpha=0.06,
-               label=f"analysis band {win['f_lo']:.2f}–{win['f_hi']:.2f} Hz")
-    ax.axvline(win["f_peak"], linestyle="--", color="#534AB7",
-               linewidth=1, label=f"f_peak = {win['f_peak']:.2f} Hz")
+def _to_list(arr) -> list:
+    """NaN → None for JSON."""
+    out = []
+    for v in np.asarray(arr, dtype=float).tolist():
+        out.append(None if (v != v) else v)  # NaN check
+    return out
+
+
+def _spectra_canvas(result: IrregularResult, win: dict) -> str:
+    f = _to_list(result.f_smooth)
+    sI = _to_list(result.S_I_smooth)
+    sR = _to_list(result.S_R_smooth)
     pad = 0.1 * (win["f_hi"] - win["f_lo"])
-    ax.set_xlim(max(0.0, win["f_lo"] - pad), win["f_hi"] + pad)
-    ax.set_xlabel("f (Hz)")
-    ax.set_ylabel("S(f) [m²/Hz]")
-    ax.set_title("Smoothed incident & reflected spectra")
-    ax.grid(True, alpha=0.25)
-    ax.legend(fontsize=9)
-    b64 = _png_b64(fig)
-    out_path.write_bytes(base64.b64decode(b64))
-    return b64
+    x_min = max(0.0, win["f_lo"] - pad)
+    x_max = win["f_hi"] + pad
+    script = f"""(function(){{
+  const f = {json.dumps(f)}, sI = {json.dumps(sI)}, sR = {json.dumps(sR)};
+  const ptsI = f.map((x,i)=>({{x, y:sI[i]}})).filter(p=>p.y!=null);
+  const ptsR = f.map((x,i)=>({{x, y:sR[i]}})).filter(p=>p.y!=null);
+  new Chart(document.getElementById('spectraChart'), {{
+    type:'line',
+    data:{{datasets:[
+      {{label:'Incident S_I', data:ptsI, borderColor:'#3266ad',
+        backgroundColor:'#3266ad', pointRadius:0, tension:0.1, borderWidth:1.5}},
+      {{label:'Reflected S_R', data:ptsR, borderColor:'#D85A30',
+        backgroundColor:'#D85A30', pointRadius:0, tension:0.1, borderWidth:1.5}}
+    ]}},
+    options:{{
+      responsive:true, maintainAspectRatio:false,
+      interaction:{{mode:'nearest', axis:'x', intersect:false}},
+      plugins:{{
+        legend:{{labels:{{boxWidth:12}}}},
+        tooltip:{{callbacks:{{
+          title:(items)=>'f = '+items[0].parsed.x.toFixed(3)+' Hz',
+          label:(ctx)=>ctx.dataset.label+': '+ctx.parsed.y.toExponential(3)+' m²/Hz'
+        }}}}
+      }},
+      scales:{{
+        x:{{type:'linear', min:{x_min}, max:{x_max}, title:{{display:true,text:'f (Hz)'}}}},
+        y:{{title:{{display:true,text:'S(f) [m²/Hz]'}}, beginAtZero:true}}
+      }}
+    }},
+    plugins:[bandPlugin({win['f_lo']}, {win['f_hi']}, {win['f_peak']})]
+  }});
+}})();"""
+    return _chart_wrap("spectraChart", 380, script)
 
 
-def _plot_kr_f(result: IrregularResult, win: dict, out_path: Path) -> str:
-    import matplotlib.pyplot as plt
-    f = result.f_smooth
-    fig, ax = plt.subplots(figsize=(7, 4))
-    ax.plot(f, result.Kr_f, color="#0F6E56", marker=".", linestyle="-")
-    ax.axvspan(win["f_lo"], win["f_hi"], color="#3266ad", alpha=0.06)
-    ax.axvline(win["f_peak"], linestyle="--", color="#534AB7", linewidth=1)
+def _kr_f_canvas(result: IrregularResult, win: dict) -> str:
+    f = _to_list(result.f_smooth)
+    kr = _to_list(result.Kr_f)
     pad = 0.1 * (win["f_hi"] - win["f_lo"])
-    ax.set_xlim(max(0.0, win["f_lo"] - pad), win["f_hi"] + pad)
-    ax.axhline(result.Kr_overall, linestyle=":", color="#A32D2D",
-               linewidth=1, label=f"$K_r$ overall = {result.Kr_overall:.3f}")
-    ax.set_xlabel("f (Hz)")
-    ax.set_ylabel(r"$K_r(f)$")
-    ax.set_ylim(bottom=0)
-    ax.set_title("Reflection coefficient vs frequency")
-    ax.grid(True, alpha=0.25)
-    ax.legend(fontsize=9)
-    b64 = _png_b64(fig)
-    out_path.write_bytes(base64.b64decode(b64))
-    return b64
+    x_min = max(0.0, win["f_lo"] - pad)
+    x_max = win["f_hi"] + pad
+    script = f"""(function(){{
+  const f = {json.dumps(f)}, kr = {json.dumps(kr)};
+  const pts = f.map((x,i)=>({{x, y:kr[i]}})).filter(p=>p.y!=null);
+  const overall = {result.Kr_overall if np.isfinite(result.Kr_overall) else 'null'};
+  new Chart(document.getElementById('krfChart'), {{
+    type:'line',
+    data:{{datasets:[
+      {{label:'K_r(f)', data:pts, borderColor:'#0F6E56',
+        backgroundColor:'#0F6E56', pointRadius:2, pointHoverRadius:5,
+        tension:0.15, borderWidth:1.5}}
+    ]}},
+    options:{{
+      responsive:true, maintainAspectRatio:false,
+      plugins:{{
+        legend:{{labels:{{boxWidth:12}}}},
+        tooltip:{{callbacks:{{
+          title:(items)=>'f = '+items[0].parsed.x.toFixed(3)+' Hz',
+          label:(ctx)=>'K_r = '+ctx.parsed.y.toFixed(3)
+        }}}}
+      }},
+      scales:{{
+        x:{{type:'linear', min:{x_min}, max:{x_max}, title:{{display:true,text:'f (Hz)'}}}},
+        y:{{title:{{display:true,text:'K_r(f)'}}, beginAtZero:true}}
+      }}
+    }},
+    plugins:[bandPlugin({win['f_lo']}, {win['f_hi']}, {win['f_peak']}),
+            hLinePlugin(overall, '#A32D2D', 'K_r overall = '+(overall==null?'—':overall.toFixed(3)))]
+  }});
+}})();"""
+    return _chart_wrap("krfChart", 380, script)
 
 
-def _plot_singularity(result: IrregularResult, meta: TestMeta,
-                      method: str, out_path: Path, win: dict) -> str:
-    import matplotlib.pyplot as plt
-    from .analysis import solve_dispersion_array
-    f = result.f
+def _singularity_canvas(result: IrregularResult, meta: TestMeta,
+                        method: str, win: dict) -> str:
+    f = np.asarray(result.f)
     k = solve_dispersion_array(f, meta.water_depth_m, g=meta.gravity_m_s2)
     if method == "goda":
         metric = np.sin(k * meta.X13_m) ** 2
         threshold = 0.05
-        label = r"$\sin^2(k X_{13})$ (Goda)"
+        y_label = "sin²(k·X13)  (Goda)"
     else:
         sb = np.sin(k * meta.X12_m)
         sg = np.sin(k * meta.X13_m)
         sgb = np.sin(k * meta.X13_m - k * meta.X12_m)
         metric = 2.0 * (sb * sb + sg * sg + sgb * sgb)
         threshold = 0.1
-        label = r"$D$ (Mansard–Funke)"
-    fig, ax = plt.subplots(figsize=(7, 3.5))
-    ax.plot(f, metric, color="#5f5e5a", linewidth=1)
-    ax.axvspan(win["f_lo"], win["f_hi"], color="#3266ad", alpha=0.06)
-    ax.axhline(threshold, linestyle="--", color="#A32D2D",
-               linewidth=1, label=f"threshold = {threshold}")
+        y_label = "D  (Mansard–Funke)"
     pad = 0.1 * (win["f_hi"] - win["f_lo"])
-    ax.set_xlim(max(0.0, win["f_lo"] - pad), win["f_hi"] + pad)
-    ax.set_xlabel("f (Hz)")
-    ax.set_ylabel(label)
-    ax.set_title("Singularity metric")
-    ax.set_ylim(bottom=0)
-    ax.grid(True, alpha=0.25)
-    ax.legend(fontsize=9)
-    b64 = _png_b64(fig)
-    out_path.write_bytes(base64.b64decode(b64))
-    return b64
+    x_min = max(0.0, win["f_lo"] - pad)
+    x_max = win["f_hi"] + pad
+    f_list = _to_list(f)
+    m_list = _to_list(metric)
+    script = f"""(function(){{
+  const f = {json.dumps(f_list)}, m = {json.dumps(m_list)};
+  const pts = f.map((x,i)=>({{x, y:m[i]}})).filter(p=>p.y!=null);
+  new Chart(document.getElementById('singChart'), {{
+    type:'line',
+    data:{{datasets:[
+      {{label:{json.dumps(y_label)}, data:pts, borderColor:'#5f5e5a',
+        backgroundColor:'#5f5e5a', pointRadius:0, borderWidth:1.2, tension:0.1}}
+    ]}},
+    options:{{
+      responsive:true, maintainAspectRatio:false,
+      plugins:{{
+        legend:{{labels:{{boxWidth:12}}}},
+        tooltip:{{callbacks:{{
+          title:(items)=>'f = '+items[0].parsed.x.toFixed(3)+' Hz',
+          label:(ctx)=>ctx.dataset.label+' = '+ctx.parsed.y.toFixed(4)
+        }}}}
+      }},
+      scales:{{
+        x:{{type:'linear', min:{x_min}, max:{x_max}, title:{{display:true,text:'f (Hz)'}}}},
+        y:{{title:{{display:true,text:{json.dumps(y_label)}}}, beginAtZero:true}}
+      }}
+    }},
+    plugins:[bandPlugin({win['f_lo']}, {win['f_hi']}, {win['f_peak']}),
+            hLinePlugin({threshold}, '#A32D2D', 'threshold = {threshold}')]
+  }});
+}})();"""
+    return _chart_wrap("singChart", 320, script)
+
+
+_CHART_PLUGINS = r"""
+function bandPlugin(fLo, fHi, fPeak){
+  return {
+    id:'band'+fLo+'_'+fHi,
+    beforeDatasetsDraw(chart){
+      const ctx = chart.ctx, xS = chart.scales.x, area = chart.chartArea;
+      const xL = xS.getPixelForValue(fLo), xR = xS.getPixelForValue(fHi);
+      ctx.save();
+      ctx.fillStyle = 'rgba(50,102,173,0.07)';
+      ctx.fillRect(xL, area.top, xR-xL, area.bottom-area.top);
+      ctx.restore();
+    },
+    afterDraw(chart){
+      const ctx = chart.ctx, xS = chart.scales.x, area = chart.chartArea;
+      const xP = xS.getPixelForValue(fPeak);
+      if(xP < area.left || xP > area.right) return;
+      ctx.save();
+      ctx.strokeStyle = '#534AB7'; ctx.lineWidth = 1; ctx.setLineDash([5,3]);
+      ctx.beginPath(); ctx.moveTo(xP, area.top); ctx.lineTo(xP, area.bottom); ctx.stroke();
+      ctx.restore();
+      ctx.fillStyle = '#534AB7';
+      ctx.font = '10px ' + getComputedStyle(document.body).fontFamily;
+      ctx.fillText('f_peak = '+fPeak.toFixed(2)+' Hz', xP+4, area.top+10);
+    }
+  };
+}
+function hLinePlugin(y, color, label){
+  return {
+    id:'hline'+y+color,
+    afterDraw(chart){
+      if(y==null) return;
+      const ctx = chart.ctx, yS = chart.scales.y, area = chart.chartArea;
+      const yp = yS.getPixelForValue(y);
+      if(yp < area.top || yp > area.bottom) return;
+      ctx.save();
+      ctx.strokeStyle = color; ctx.lineWidth = 1; ctx.setLineDash([2,3]);
+      ctx.beginPath(); ctx.moveTo(area.left, yp); ctx.lineTo(area.right, yp); ctx.stroke();
+      ctx.restore();
+      ctx.fillStyle = color;
+      ctx.font = '10px ' + getComputedStyle(document.body).fontFamily;
+      ctx.fillText(label, area.left+6, yp-4);
+    }
+  };
+}
+"""
 
 
 def _write_spectrum_csv(result: IrregularResult, out_path: Path) -> Path:
@@ -189,14 +296,6 @@ def _summary_cards(result: IrregularResult, win: dict) -> str:
     )
 
 
-def _img_tag(b64: str, alt: str) -> str:
-    return (
-        f'<img src="data:image/png;base64,{b64}" alt="{html.escape(alt)}" '
-        f'style="max-width:100%;height:auto;border-radius:var(--border-radius-md);'
-        f'background:var(--color-background-secondary);padding:0.5rem;"/>'
-    )
-
-
 def write_irregular_report(
     result: IrregularResult,
     meta: TestMeta,
@@ -211,13 +310,7 @@ def write_irregular_report(
     win = _window_info(result, meta)
     stem = f"{result.test_id}_{method}"
 
-    spec_png = out_dir / f"{stem}_spectra.png"
-    kr_png = out_dir / f"{stem}_kr_f.png"
-    sing_png = out_dir / f"{stem}_singularity.png"
     csv_path = out_dir / f"{stem}_spectrum.csv"
-    b64_spec = _plot_spectra(result, win, spec_png)
-    b64_kr = _plot_kr_f(result, win, kr_png)
-    b64_sing = _plot_singularity(result, meta, method, sing_png, win)
     _write_spectrum_csv(result, csv_path)
 
     header = (
@@ -237,7 +330,6 @@ def write_irregular_report(
         f'Tank layout (depth {meta.water_depth_m:g} m)</p>'
         f'{_tank_svg(meta)}</div>'
     )
-    # _geometry_cards expects per-test t_gen rows; reuse with a single synthetic row.
     geo_rows = [{"t_gen": meta.t_gen_s}]
 
     body = "\n".join([
@@ -247,18 +339,23 @@ def write_irregular_report(
         "<h2>Summary</h2>",
         _summary_cards(result, win),
         "<h2>Incident & reflected spectra</h2>",
-        _img_tag(b64_spec, "spectra"),
+        _spectra_canvas(result, win),
         "<h2>K<sub>r</sub>(f)</h2>",
-        _img_tag(b64_kr, "Kr vs f"),
+        _kr_f_canvas(result, win),
         "<h2>Singularity metric</h2>",
-        _img_tag(b64_sing, "singularity metric"),
+        _singularity_canvas(result, meta, method, win),
     ])
 
     html_doc = (
         '<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">'
         '<meta name="viewport" content="width=device-width,initial-scale=1.0">'
         f'<title>{html.escape(result.test_id)} reflection report</title>'
-        f'<style>{_CSS}</style></head><body>{body}</body></html>'
+        f'<style>{_CSS}</style>'
+        f'<script src="{CHARTJS_CDN}"></script>'
+        f'</head><body>'
+        f'<script>{_CHART_DEFAULTS}</script>'
+        f'<script>{_CHART_PLUGINS}</script>'
+        f'{body}</body></html>'
     )
     out_path = out_dir / f"{stem}_report.html"
     out_path.write_text(html_doc, encoding="utf-8")

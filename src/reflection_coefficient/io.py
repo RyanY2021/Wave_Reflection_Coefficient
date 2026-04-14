@@ -53,7 +53,7 @@ def _load_user_config() -> dict:
     if not USER_CONFIG_PATH.exists():
         return {}
     try:
-        with open(USER_CONFIG_PATH) as f:
+        with open(USER_CONFIG_PATH, encoding="utf-8") as f:
             return json.load(f) or {}
     except (json.JSONDecodeError, OSError):
         return {}
@@ -61,7 +61,7 @@ def _load_user_config() -> dict:
 
 def _save_user_config(cfg: dict) -> None:
     USER_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with open(USER_CONFIG_PATH, "w") as f:
+    with open(USER_CONFIG_PATH, "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=2)
 
 
@@ -143,7 +143,7 @@ def resolve_data_dir(explicit: Path | str | None = None) -> Path:
 
 def load_tank_config(path: Path | str | None = None) -> dict:
     p = resolve_tank_config(path)
-    with open(p) as f:
+    with open(p, encoding="utf-8") as f:
         return json.load(f)
 
 

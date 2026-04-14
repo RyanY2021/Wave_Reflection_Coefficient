@@ -265,6 +265,8 @@ def _write_kr_vs_freq(
     except ImportError:
         return csv_path, None
     fig, ax = plt.subplots(figsize=(6, 4))
+    fig.patch.set_alpha(0.0)
+    ax.set_facecolor("none")
     fs = [r.f_Hz for r in rows]
     krs = [r.Kr for r in rows]
     ax.plot(fs, krs, marker="o", linestyle="-")
@@ -278,7 +280,7 @@ def _write_kr_vs_freq(
     ax.set_ylim(bottom=0)
     png_path = out_dir / f"rw_kr_vs_freq_{method}.png"
     fig.tight_layout()
-    fig.savefig(png_path, dpi=150)
+    fig.savefig(png_path, dpi=150, transparent=True)
     plt.close(fig)
     print(f"[run_analysis] wrote {png_path}")
     return csv_path, png_path
