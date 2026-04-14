@@ -10,7 +10,7 @@ Three independent inputs are combined for each test:
   (``<data_dir>/<scheme>/<TEST_ID>.txt``). The loader tries both.
 
 Any of the three may be overridden on the CLI. When overridden, the chosen
-path is persisted to ``~/.reflection_coefficient.json`` so subsequent runs
+path is persisted to ``<project>/.reflection_coefficient.json`` so subsequent runs
 pick it up automatically.
 
 Derived quantities (``k``, ``L``, ``cg``, clipping window, ...) are **not**
@@ -39,7 +39,7 @@ DEFAULT_TANK_CONFIG = _PKG_ROOT / "experiment_data" / "tank_config.json"
 DEFAULT_METADATA_DIR = _PKG_ROOT / "experiment_data" / "metadata"
 DEFAULT_DATA_DIR = _PKG_ROOT / "experiment_data"
 
-USER_CONFIG_PATH = Path.home() / ".reflection_coefficient.json"
+USER_CONFIG_PATH = _PKG_ROOT / ".reflection_coefficient.json"
 
 _PATH_KEYS = ("tank_config", "metadata_dir", "data_dir")
 
@@ -76,6 +76,45 @@ def save_paths(
         if value is not None:
             cfg[key] = str(Path(value).resolve())
     _save_user_config(cfg)
+
+
+def save_method(method: str) -> None:
+    """Persist the separation method choice for reuse in later runs."""
+    cfg = _load_user_config()
+    cfg["method"] = method
+    _save_user_config(cfg)
+
+
+def resolve_method(explicit: str | None, default: str = "least_squares") -> str:
+    if explicit is not None:
+        return explicit
+    return _load_user_config().get("method", default)
+
+
+def save_window(window: str | None = None, bandwidth_Hz: float | None = None) -> None:
+    """Persist the window-type and/or bandwidth choice."""
+    cfg = _load_user_config()
+    if window is not None:
+        cfg["window"] = window
+    if bandwidth_Hz is not None:
+        cfg["bandwidth_Hz"] = float(bandwidth_Hz)
+    _save_user_config(cfg)
+
+
+def resolve_window(
+    explicit_window: str | None,
+    explicit_bandwidth: float | None,
+    default_window: str = "hann",
+    default_bandwidth: float = 0.04,
+) -> tuple[str, float | None]:
+    """Resolve (window, bandwidth_Hz). Bandwidth is None when window == 'none'."""
+    cfg = _load_user_config()
+    window = explicit_window if explicit_window is not None else cfg.get("window", default_window)
+    if window == "none":
+        return window, None
+    if explicit_bandwidth is not None:
+        return window, float(explicit_bandwidth)
+    return window, float(cfg.get("bandwidth_Hz", default_bandwidth))
 
 
 def _resolve(key: str, explicit: Path | str | None, default: Path) -> Path:

@@ -213,6 +213,8 @@ def analyse_irregular(
     apply_window: bool = True,
     band_lo_factor: float = 0.5,
     band_hi_factor: float = 2.5,
+    window: str = "hann",
+    bandwidth_Hz: float | None = None,
 ) -> IrregularResult:
     """Irregular-wave reflection analysis (white-noise or JONSWAP).
 
@@ -252,13 +254,28 @@ def analyse_irregular(
         )
     e1, e2, e3 = remove_mean(e1), remove_mean(e2), remove_mean(e3)
 
+    fs = 1.0 / np.mean(np.diff(t_c))
+    N_raw = e1.size
+    df_raw = fs / N_raw
+
     win_corr = 1.0
-    if apply_window:
-        w = hanning_window(e1.size)
+    if window == "hann" and apply_window:
+        w = hanning_window(N_raw)
         win_corr = float(np.mean(w * w))
         e1, e2, e3 = e1 * w, e2 * w, e3 * w
+        # Hann noise-equivalent bandwidth (single full-record window):
+        enbw_raw = 1.5 * df_raw
+    elif window == "none":
+        enbw_raw = df_raw
+    else:
+        raise ValueError(f"Unknown window {window!r}; expected 'hann' or 'none'")
 
-    fs = 1.0 / np.mean(np.diff(t_c))
+    # If an explicit resolution bandwidth was requested, choose n_bands so the
+    # smoothed ENBW ≈ bandwidth_Hz. Otherwise keep the caller-supplied default.
+    if bandwidth_Hz is not None:
+        n_bands = max(1, int(round(bandwidth_Hz / enbw_raw)))
+    bandwidth_effective = n_bands * enbw_raw
+
     N = e1.size
     df = fs / N
     freqs, B1 = positive_fft(e1, fs)
@@ -294,9 +311,15 @@ def analyse_irregular(
     with np.errstate(divide="ignore", invalid="ignore"):
         Kr_f = np.sqrt(S_R_s / S_I_s)
 
-    # Analysis band for the overall / integrated quantities
-    f_min = band_lo_factor * f_peak
-    f_max = band_hi_factor * f_peak
+    # Analysis band for the overall / integrated quantities.
+    # Metadata [f_min_Hz, f_max_Hz] (WN flat band, JS cutoffs) takes precedence
+    # over the peak-relative default — white-noise spectra have no energy
+    # outside that interval, so integrating across it pollutes m0 with noise.
+    if meta.f_min_Hz is not None and meta.f_max_Hz is not None:
+        f_min, f_max = float(meta.f_min_Hz), float(meta.f_max_Hz)
+    else:
+        f_min = band_lo_factor * f_peak
+        f_max = band_hi_factor * f_peak
     band = (f_pos >= f_min) & (f_pos <= f_max) & valid
     m0_I = float(np.nansum(S_I[band]) * df)
     m0_R = float(np.nansum(S_R[band]) * df)
@@ -322,6 +345,9 @@ def analyse_irregular(
         "D_or_sin2_min": float(np.nanmin(D_or_sin2[band])) if np.any(band) else float("nan"),
         "n_bins_valid": int(np.count_nonzero(band)),
         "f_peak_used_Hz": float(f_peak),
+        "window": window,
+        "n_bands": int(n_bands),
+        "bandwidth_Hz": float(bandwidth_effective),
     }
 
     return IrregularResult(
@@ -350,8 +376,13 @@ def analyse(
     eta3: np.ndarray,
     meta: TestMeta,
     method: MethodName = "least_squares",
+    window: str = "hann",
+    bandwidth_Hz: float | None = None,
 ) -> RegularResult | IrregularResult:
     """Dispatch to the regular or irregular path based on ``meta.campaign``."""
     if meta.campaign == "rw":
         return analyse_regular(t, eta1, eta2, eta3, meta, method=method)
-    return analyse_irregular(t, eta1, eta2, eta3, meta, method=method)
+    return analyse_irregular(
+        t, eta1, eta2, eta3, meta, method=method,
+        window=window, bandwidth_Hz=bandwidth_Hz,
+    )

@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import csv
 import sys
+from datetime import datetime
 from pathlib import Path
 
 from reflection_coefficient.io import (
@@ -25,10 +26,16 @@ from reflection_coefficient.io import (
     load_probe_data,
     resolve_data_dir,
     resolve_metadata_dir,
+    resolve_method,
     resolve_tank_config,
+    resolve_window,
+    save_method,
     save_paths,
+    save_window,
 )
+from reflection_coefficient.irregular_report import write_irregular_report
 from reflection_coefficient.pipeline import IrregularResult, RegularResult, analyse
+from reflection_coefficient.rw_report import write_rw_report
 
 SCHEME_LABELS = {
     "rw": "REGULAR WAVE",
@@ -76,8 +83,22 @@ def main() -> None:
         "--test", default="all",
         help="Test id (e.g. RW005) or 'all' for every test found.",
     )
-    parser.add_argument("--output", type=Path, default=Path("results"))
-    parser.add_argument("--method", choices=["goda", "least_squares"], default="least_squares")
+    parser.add_argument(
+        "--output", type=Path, default=None,
+        help="Parent output dir (default: <project>/results). A timestamped subfolder is created per run.",
+    )
+    parser.add_argument(
+        "--method", choices=["goda", "least_squares"], default=None,
+        help="Separation method. Persisted when set; defaults to last choice (or least_squares).",
+    )
+    parser.add_argument(
+        "--window", choices=["none", "hann"], default=None,
+        help="Spectral window for irregular-wave FFT. Persisted when set (default: hann).",
+    )
+    parser.add_argument(
+        "--bandwidth", type=float, default=None,
+        help="Target resolution bandwidth in Hz (only with --window hann). Persisted when set (default: 0.04).",
+    )
     parser.add_argument(
         "--list", action="store_true",
         help="List tests discovered for the chosen scheme and exit.",
@@ -98,6 +119,14 @@ def main() -> None:
         )
         print(f"[run_analysis] updated saved paths in {USER_CONFIG_PATH}")
 
+    if args.method is not None:
+        save_method(args.method)
+    args.method = resolve_method(args.method)
+
+    if args.window is not None or args.bandwidth is not None:
+        save_window(window=args.window, bandwidth_Hz=args.bandwidth)
+    args.window, args.bandwidth = resolve_window(args.window, args.bandwidth)
+
     tank_cfg = resolve_tank_config(args.tank_config)
     meta_dir = resolve_metadata_dir(args.metadata_dir)
     data_dir = resolve_data_dir(args.data_dir)
@@ -106,6 +135,9 @@ def main() -> None:
         print(f"  tank_config  = {tank_cfg}")
         print(f"  metadata_dir = {meta_dir}")
         print(f"  data_dir     = {data_dir}")
+        print(f"  method       = {args.method}")
+        bw_txt = f"{args.bandwidth:g} Hz" if args.bandwidth is not None else "—"
+        print(f"  window       = {args.window}  (bandwidth: {bw_txt})")
         return
 
     for label, p in [("tank_config", tank_cfg), ("metadata_dir", meta_dir), ("data_dir", data_dir)]:
@@ -117,9 +149,10 @@ def main() -> None:
         "Select wave scheme for this run:", ("rw", "wn", "js")
     )
 
+    bw_txt = f"{args.bandwidth:g} Hz" if args.bandwidth is not None else "—"
     banner = (
-        f" {SCHEME_LABELS[scheme]} | data_dir={data_dir} "
-        f"| metadata_dir={meta_dir} "
+        f" {SCHEME_LABELS[scheme]} | method={args.method} "
+        f"| window={args.window} (bw {bw_txt}) "
     )
     print("=" * len(banner))
     print(banner)
@@ -134,6 +167,13 @@ def main() -> None:
         return
 
     if args.test == "all":
+        if scheme != "rw":
+            print(
+                f"[run_analysis] --test all is only supported for --scheme rw; "
+                f"specify a single {scheme.upper()}### test id for irregular schemes.",
+                file=sys.stderr,
+            )
+            sys.exit(2)
         selected = available
     elif args.test in available:
         selected = [args.test]
@@ -141,8 +181,13 @@ def main() -> None:
         print(f"Test {args.test!r} not found under {data_dir}.", file=sys.stderr)
         sys.exit(2)
 
-    args.output.mkdir(parents=True, exist_ok=True)
+    _project_root = Path(__file__).resolve().parents[1]
+    output_parent = args.output if args.output is not None else _project_root / "results"
+    run_dir = output_parent / datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_dir.mkdir(parents=True, exist_ok=True)
+    print(f"[run_analysis] output dir: {run_dir}")
     regular_results: list[RegularResult] = []
+    regular_metas: list = []
     for tid in selected:
         t, eta1, eta2, eta3, meta = load_probe_data(
             tid, campaign=scheme,
@@ -150,16 +195,32 @@ def main() -> None:
         )
         print(f"[run_analysis] {tid}: N={len(t)}, fs≈{1/(t[1]-t[0]):.1f} Hz")
         try:
-            result = analyse(t, eta1, eta2, eta3, meta, method=args.method)
+            result = analyse(
+                t, eta1, eta2, eta3, meta,
+                method=args.method,
+                window=args.window, bandwidth_Hz=args.bandwidth,
+            )
         except Exception as exc:
             print(f"  !! {tid}: {exc}", file=sys.stderr)
             continue
         _report(result)
         if isinstance(result, RegularResult):
             regular_results.append(result)
+            regular_metas.append(meta)
+        elif isinstance(result, IrregularResult):
+            html_path = write_irregular_report(
+                result, meta, run_dir, args.method, timestamp=run_dir.name,
+            )
+            print(f"[run_analysis] wrote {html_path}")
 
     if scheme == "rw" and len(regular_results) >= 2:
-        _write_kr_vs_freq(regular_results, args.output, args.method)
+        csv_path, png_path = _write_kr_vs_freq(regular_results, run_dir, args.method)
+        html_path = write_rw_report(
+            list(zip(regular_results, regular_metas)),
+            run_dir, args.method,
+            csv_path=csv_path, png_path=png_path, timestamp=run_dir.name,
+        )
+        print(f"[run_analysis] wrote {html_path}")
 
 
 def _report(result: RegularResult | IrregularResult) -> None:
@@ -180,8 +241,13 @@ def _report(result: RegularResult | IrregularResult) -> None:
         )
 
 
-def _write_kr_vs_freq(results: list[RegularResult], out_dir: Path, method: str) -> None:
-    """Aggregate regular-wave runs into a Kr(f) table (+ plot if matplotlib)."""
+def _write_kr_vs_freq(
+    results: list[RegularResult], out_dir: Path, method: str,
+) -> tuple[Path, Path | None]:
+    """Aggregate regular-wave runs into a Kr(f) table (+ plot if matplotlib).
+
+    Returns ``(csv_path, png_path_or_None)``.
+    """
     rows = sorted(results, key=lambda r: r.f_Hz)
     csv_path = out_dir / f"rw_kr_vs_freq_{method}.csv"
     with csv_path.open("w", newline="") as fh:
@@ -197,7 +263,7 @@ def _write_kr_vs_freq(results: list[RegularResult], out_dir: Path, method: str) 
     try:
         import matplotlib.pyplot as plt
     except ImportError:
-        return
+        return csv_path, None
     fig, ax = plt.subplots(figsize=(6, 4))
     fs = [r.f_Hz for r in rows]
     krs = [r.Kr for r in rows]
@@ -215,6 +281,7 @@ def _write_kr_vs_freq(results: list[RegularResult], out_dir: Path, method: str) 
     fig.savefig(png_path, dpi=150)
     plt.close(fig)
     print(f"[run_analysis] wrote {png_path}")
+    return csv_path, png_path
 
 
 if __name__ == "__main__":
