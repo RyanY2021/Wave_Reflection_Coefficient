@@ -7,6 +7,10 @@ name = "reflection_coefficient"
 version = "0.1.0"
 description = "Compute wave tank reflection coefficients from experimental probe data."
 readme = "README.md"
+license = { file = "LICENSE" }
+authors = [
+    { name = "Ryan You" },
+]
 requires-python = ">=3.10"
 dependencies = [
     "numpy",
