@@ -44,6 +44,35 @@ SCHEME_LABELS = {
 }
 
 
+class _Tee:
+    """Duplicate writes to an underlying stream and a log file."""
+
+    def __init__(self, stream, log_fh):
+        self._stream = stream
+        self._log = log_fh
+
+    def write(self, s):
+        self._stream.write(s)
+        self._log.write(s)
+        self._log.flush()
+
+    def flush(self):
+        self._stream.flush()
+        self._log.flush()
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+
+def _prune_logs(log_dir: Path, keep: int) -> None:
+    logs = sorted(log_dir.glob("*.log"), key=lambda p: p.stat().st_mtime)
+    for old in logs[:-keep] if keep > 0 else logs:
+        try:
+            old.unlink()
+        except OSError:
+            pass
+
+
 def _prompt_choice(question: str, choices: tuple[str, ...]) -> str:
     menu = "  ".join(f"[{i + 1}] {c}" for i, c in enumerate(choices))
     while True:
@@ -107,7 +136,38 @@ def main() -> None:
         "--show-paths", action="store_true",
         help="Print the resolved tank_config / metadata_dir / data_dir and exit.",
     )
+    parser.add_argument(
+        "--no-log", action="store_true",
+        help="Disable writing a per-run log file under <project>/log/.",
+    )
+    parser.add_argument(
+        "--log-keep", type=int, default=10,
+        help="Number of recent log files to retain (default: 10; 0 = keep all).",
+    )
     args = parser.parse_args()
+
+    log_fh = None
+    if not args.no_log and not args.show_paths and not args.list:
+        project_root = Path(__file__).resolve().parents[1]
+        log_dir = project_root / "log"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_path = log_dir / (datetime.now().strftime("%Y%m%d_%H%M%S") + ".log")
+        log_fh = open(log_path, "w", encoding="utf-8")
+        sys.stdout = _Tee(sys.stdout, log_fh)
+        sys.stderr = _Tee(sys.stderr, log_fh)
+        print(f"[run_analysis] log file: {log_path}")
+        _prune_logs(log_dir, args.log_keep)
+
+    try:
+        _run(args)
+    finally:
+        if log_fh is not None:
+            sys.stdout = sys.stdout._stream  # type: ignore[attr-defined]
+            sys.stderr = sys.stderr._stream  # type: ignore[attr-defined]
+            log_fh.close()
+
+
+def _run(args) -> None:
 
     # Persist any explicitly provided paths before resolving (so the saved
     # values are available to later invocations regardless of errors below).
@@ -184,8 +244,13 @@ def main() -> None:
     _project_root = Path(__file__).resolve().parents[1]
     output_parent = args.output if args.output is not None else _project_root / "results"
     run_dir = output_parent / datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_dir.mkdir(parents=True, exist_ok=True)
-    print(f"[run_analysis] output dir: {run_dir}")
+
+    def _ensure_run_dir() -> Path:
+        if not run_dir.exists():
+            run_dir.mkdir(parents=True, exist_ok=True)
+            print(f"[run_analysis] output dir: {run_dir}")
+        return run_dir
+
     regular_results: list[RegularResult] = []
     regular_metas: list = []
     for tid in selected:
@@ -208,17 +273,19 @@ def main() -> None:
             regular_results.append(result)
             regular_metas.append(meta)
         elif isinstance(result, IrregularResult):
+            out = _ensure_run_dir()
             html_path = write_irregular_report(
-                result, meta, run_dir, args.method, timestamp=run_dir.name,
+                result, meta, out, args.method, timestamp=out.name,
             )
             print(f"[run_analysis] wrote {html_path}")
 
     if scheme == "rw" and len(regular_results) >= 2:
-        csv_path, png_path = _write_kr_vs_freq(regular_results, run_dir, args.method)
+        out = _ensure_run_dir()
+        csv_path, png_path = _write_kr_vs_freq(regular_results, out, args.method)
         html_path = write_rw_report(
             list(zip(regular_results, regular_metas)),
-            run_dir, args.method,
-            csv_path=csv_path, png_path=png_path, timestamp=run_dir.name,
+            out, args.method,
+            csv_path=csv_path, png_path=png_path, timestamp=out.name,
         )
         print(f"[run_analysis] wrote {html_path}")
 

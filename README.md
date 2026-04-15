@@ -10,11 +10,6 @@ Regular-wave tests give a single `Kr = |a_r|/|a_i|` per frequency;
 irregular-wave tests (white-noise / JONSWAP) give a band-averaged `Kr(f)` curve
 plus an energy-based `Kr_overall = sqrt(m0_R / m0_I)`.
 
-> The operational spec lives in **`docs/reflection_processing_pipeline.md`**.
-> Agent/project conventions live in **`CLAUDE.md`** — read those for anything
-> the README doesn't cover (data layout, metadata schema, FFT sign convention,
-> singularity masks, etc.).
-
 ## Project structure
 
 ```
@@ -33,7 +28,6 @@ Reflection_Coefficient/
 ├── scripts/run_analysis.py    # CLI entry point
 ├── tests/                     # pytest suite
 ├── experiment_data/           # tank_config.json, metadata/*.csv, raw RW###.txt / WN###.txt
-├── docs/                      # reference PDFs + processing pipeline spec
 └── results/                   # generated output (gitignored)
 ```
 
@@ -55,6 +49,26 @@ pytest
 pytest tests/test_smoke.py::test_version    # single test
 ruff check .
 ```
+
+## Project initialization
+
+`experiment_data/` is gitignored, so a fresh clone has no tank config or
+metadata CSVs. Generate the input scaffold before the first analysis run:
+
+```bash
+python scripts/init_project.py
+```
+
+This creates `experiment_data/tank_config.json` (placeholder geometry + water
+depth), empty `experiment_data/metadata/{rw,wn,js}.csv` with headers, and the
+`experiment_data/{rw,wn,js}/` subfolders for raw probe txt files. Existing
+files are preserved unless you pass `--force`. Any of `--tank-config`,
+`--metadata-dir`, `--data-dir` can redirect the scaffold elsewhere, and those
+paths are persisted for subsequent `run_analysis.py` calls.
+
+Then fill in the geometry fields in `tank_config.json`, add per-test rows to
+the metadata CSVs, and drop raw `<TEST_ID>.txt` files into `experiment_data/`
+(flat or under the scheme subfolder).
 
 ## CLI — `scripts/run_analysis.py`
 
@@ -159,17 +173,11 @@ Q coefficients), this is the tripwire.
 
 ## References
 
-Papers in `docs/`:
-
 - *Isolating incident and reflected wave spectra* — Goda & Suzuki.
 - *Separation of incident and reflected spectra in wave flumes.*
 - *The measurement of incident and reflected spectra using a least squares
   method* — Mansard & Funke.
 - *The propagation of the waves in the CTO SA towing tank* — tank context.
-
-`docs/reflection_processing_pipeline.md` is the operational spec that the code
-follows — refer to it for the canonical step ordering, formulae, and
-singularity-mask thresholds.
 
 ## License
 

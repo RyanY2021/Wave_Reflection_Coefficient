@@ -26,4 +26,8 @@ results/
 docs/
 experiment_data/
 notebooks/
+log/
 *.log
+
+# Config
+.*.json
