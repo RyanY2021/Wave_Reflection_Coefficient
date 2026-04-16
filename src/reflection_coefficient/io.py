@@ -117,6 +117,39 @@ def resolve_window(
     return window, float(cfg.get("bandwidth_Hz", default_bandwidth))
 
 
+def save_drops(
+    head_drop_s: float | None = None, tail_drop_s: float | None = None
+) -> None:
+    """Persist the head/tail analysis-window drop durations (seconds)."""
+    cfg = _load_user_config()
+    if head_drop_s is not None:
+        cfg["head_drop_s"] = float(head_drop_s)
+    if tail_drop_s is not None:
+        cfg["tail_drop_s"] = float(tail_drop_s)
+    _save_user_config(cfg)
+
+
+def resolve_drops(
+    explicit_head: float | None,
+    explicit_tail: float | None,
+    default_head: float = 3.0,
+    default_tail: float = 3.0,
+) -> tuple[float, float]:
+    """Resolve (head_drop_s, tail_drop_s) from CLI / stored / default."""
+    cfg = _load_user_config()
+    head = (
+        float(explicit_head)
+        if explicit_head is not None
+        else float(cfg.get("head_drop_s", default_head))
+    )
+    tail = (
+        float(explicit_tail)
+        if explicit_tail is not None
+        else float(cfg.get("tail_drop_s", default_tail))
+    )
+    return max(head, 0.0), max(tail, 0.0)
+
+
 def _resolve(key: str, explicit: Path | str | None, default: Path) -> Path:
     if explicit is not None:
         return Path(explicit)

@@ -25,10 +25,12 @@ from reflection_coefficient.io import (
     list_tests,
     load_probe_data,
     resolve_data_dir,
+    resolve_drops,
     resolve_metadata_dir,
     resolve_method,
     resolve_tank_config,
     resolve_window,
+    save_drops,
     save_method,
     save_paths,
     save_window,
@@ -129,6 +131,14 @@ def main() -> None:
         help="Target resolution bandwidth in Hz (only with --window hann). Persisted when set (default: 0.04).",
     )
     parser.add_argument(
+        "--head-drop", type=float, default=None,
+        help="Seconds to drop from the start of the clean analysis window. Persisted when set (default: 3.0).",
+    )
+    parser.add_argument(
+        "--tail-drop", type=float, default=None,
+        help="Seconds to drop from the end of the clean analysis window. Persisted when set (default: 3.0).",
+    )
+    parser.add_argument(
         "--list", action="store_true",
         help="List tests discovered for the chosen scheme and exit.",
     )
@@ -187,6 +197,10 @@ def _run(args) -> None:
         save_window(window=args.window, bandwidth_Hz=args.bandwidth)
     args.window, args.bandwidth = resolve_window(args.window, args.bandwidth)
 
+    if args.head_drop is not None or args.tail_drop is not None:
+        save_drops(head_drop_s=args.head_drop, tail_drop_s=args.tail_drop)
+    args.head_drop, args.tail_drop = resolve_drops(args.head_drop, args.tail_drop)
+
     tank_cfg = resolve_tank_config(args.tank_config)
     meta_dir = resolve_metadata_dir(args.metadata_dir)
     data_dir = resolve_data_dir(args.data_dir)
@@ -198,6 +212,10 @@ def _run(args) -> None:
         print(f"  method       = {args.method}")
         bw_txt = f"{args.bandwidth:g} Hz" if args.bandwidth is not None else "—"
         print(f"  window       = {args.window}  (bandwidth: {bw_txt})")
+        print(
+            f"  drops        = head {args.head_drop:g} s, "
+            f"tail {args.tail_drop:g} s"
+        )
         return
 
     for label, p in [("tank_config", tank_cfg), ("metadata_dir", meta_dir), ("data_dir", data_dir)]:
@@ -213,6 +231,7 @@ def _run(args) -> None:
     banner = (
         f" {SCHEME_LABELS[scheme]} | method={args.method} "
         f"| window={args.window} (bw {bw_txt}) "
+        f"| drops head {args.head_drop:g}s tail {args.tail_drop:g}s "
     )
     print("=" * len(banner))
     print(banner)
@@ -264,6 +283,7 @@ def _run(args) -> None:
                 t, eta1, eta2, eta3, meta,
                 method=args.method,
                 window=args.window, bandwidth_Hz=args.bandwidth,
+                head_drop_s=args.head_drop, tail_drop_s=args.tail_drop,
             )
         except Exception as exc:
             print(f"  !! {tid}: {exc}", file=sys.stderr)
@@ -281,11 +301,11 @@ def _run(args) -> None:
 
     if scheme == "rw" and len(regular_results) >= 2:
         out = _ensure_run_dir()
-        csv_path, png_path = _write_kr_vs_freq(regular_results, out, args.method)
+        csv_path = _write_kr_vs_freq(regular_results, out, args.method)
         html_path = write_rw_report(
             list(zip(regular_results, regular_metas)),
             out, args.method,
-            csv_path=csv_path, png_path=png_path, timestamp=out.name,
+            csv_path=csv_path, timestamp=out.name,
         )
         print(f"[run_analysis] wrote {html_path}")
 
@@ -310,11 +330,8 @@ def _report(result: RegularResult | IrregularResult) -> None:
 
 def _write_kr_vs_freq(
     results: list[RegularResult], out_dir: Path, method: str,
-) -> tuple[Path, Path | None]:
-    """Aggregate regular-wave runs into a Kr(f) table (+ plot if matplotlib).
-
-    Returns ``(csv_path, png_path_or_None)``.
-    """
+) -> Path:
+    """Aggregate regular-wave runs into a Kr(f) CSV table and return its path."""
     rows = sorted(results, key=lambda r: r.f_Hz)
     csv_path = out_dir / f"rw_kr_vs_freq_{method}.csv"
     with csv_path.open("w", newline="") as fh:
@@ -326,31 +343,7 @@ def _write_kr_vs_freq(
                 f"{r.H_I:.6f}", f"{r.H_R:.6f}", f"{r.Kr:.6f}", int(r.singularity_ok),
             ])
     print(f"[run_analysis] wrote {csv_path}")
-
-    try:
-        import matplotlib.pyplot as plt
-    except ImportError:
-        return csv_path, None
-    fig, ax = plt.subplots(figsize=(6, 4))
-    fig.patch.set_alpha(0.0)
-    ax.set_facecolor("none")
-    fs = [r.f_Hz for r in rows]
-    krs = [r.Kr for r in rows]
-    ax.plot(fs, krs, marker="o", linestyle="-")
-    for r in rows:
-        if not r.singularity_ok:
-            ax.plot([r.f_Hz], [r.Kr], marker="x", color="red")
-    ax.set_xlabel("f [Hz]")
-    ax.set_ylabel(r"$K_r$")
-    ax.set_title(f"Regular-wave reflection coefficient ({method})")
-    ax.grid(True, alpha=0.3)
-    ax.set_ylim(bottom=0)
-    png_path = out_dir / f"rw_kr_vs_freq_{method}.png"
-    fig.tight_layout()
-    fig.savefig(png_path, dpi=150, transparent=True)
-    plt.close(fig)
-    print(f"[run_analysis] wrote {png_path}")
-    return csv_path, png_path
+    return csv_path
 
 
 if __name__ == "__main__":

@@ -88,9 +88,11 @@ Three path inputs and three analysis choices are **persisted per-user** in
 | `--method {goda,least_squares}` | default: `least_squares` | ✔ | Separation method. Goda uses probes 1 & 3; Mansard–Funke uses all three. |
 | `--window {none,hann}` | default: `hann` | ✔ | Spectral window for the irregular-wave FFT. Ignored for `rw`. |
 | `--bandwidth HZ` | default: `0.04` | ✔ | Target resolution bandwidth in Hz for band-averaging (only meaningful with `--window hann`). |
+| `--head-drop SEC` | default: `3.0` | ✔ | Seconds to trim from the **start** of the clean analysis window, so the FFT skips ramp-up transients. |
+| `--tail-drop SEC` | default: `3.0` | ✔ | Seconds to trim from the **end** of the clean analysis window, so the FFT skips ramp-down transients. |
 | `--output PATH` | default: `<project>/results` | — | Parent output dir. A timestamped subfolder `YYYYMMDD_HHMMSS/` is created per run. |
 | `--list` | flag | — | List discoverable tests for the chosen scheme and exit. |
-| `--show-paths` | flag | — | Print the resolved `tank_config` / `metadata_dir` / `data_dir` / `method` / `window` and exit. |
+| `--show-paths` | flag | — | Print the resolved `tank_config` / `metadata_dir` / `data_dir` / `method` / `window` / drops and exit. |
 | `-h`, `--help` | flag | — | Show help. |
 
 ### Typical workflows
@@ -115,6 +117,10 @@ python scripts/run_analysis.py \
 python scripts/run_analysis.py --scheme wn --test WN003 \
     --window hann --bandwidth 0.04
 
+# Widen the head/tail drop to exclude longer ramp transients
+python scripts/run_analysis.py --scheme rw --test all \
+    --head-drop 5 --tail-drop 5
+
 # Inspect resolved configuration
 python scripts/run_analysis.py --show-paths
 
@@ -136,7 +142,7 @@ depend on scheme and selection:
 | Scheme / selection | Files written |
 |---|---|
 | `rw` single test | console summary only |
-| `rw` with `--test all` (≥2 tests) | `rw_kr_vs_freq_<method>.csv`, `rw_kr_vs_freq_<method>.png`, `rw_report_<method>.html` |
+| `rw` with `--test all` (≥2 tests) | `rw_kr_vs_freq_<method>.csv`, `rw_report_<method>.html` |
 | `wn` or `js` (single test) | `<TEST>_<method>_spectrum.csv`, `<TEST>_<method>_report.html` |
 
 The HTML reports use **Chart.js** for interactive, tooltipped plots (Gantt of

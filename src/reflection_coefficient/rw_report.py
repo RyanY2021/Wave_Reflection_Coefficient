@@ -17,50 +17,39 @@ import json
 import math
 from pathlib import Path
 
-from .analysis import group_velocity, solve_dispersion
 from .io import TestMeta
-from .pipeline import RegularResult, clip_bounds
+from .pipeline import RegularResult
 
 
 def _row_for(result: RegularResult, meta: TestMeta) -> dict:
-    depth = meta.water_depth_m
-    g = meta.gravity_m_s2
-    x_paddle = meta.x_paddle_to_wp1_m
-    x_struct = meta.x_wp3_to_struct_m
-    X13 = meta.X13_m
+    """Build a report row from a pipeline result.
 
+    All time-window quantities come from the pipeline (``analyse_regular``)
+    to guarantee the HTML matches the window the Kr was computed over.
+    """
     f = result.f_Hz
     T = 1.0 / f
-    k, L = solve_dispersion(f, depth, g=g)
     omega = 2.0 * math.pi * f
-    c = omega / k
-    cg = group_velocity(f, depth, g=g)
-    t_start, t_end_raw = clip_bounds(cg, x_paddle, x_struct, X13)
-    t_gen = meta.t_gen_s
-
-    if t_gen is None:
-        t_end = t_end_raw
-        status = "OK"
-    elif t_start >= t_gen:
-        t_end = t_start
-        status = "NO_WINDOW"
-    elif t_end_raw > t_gen:
-        t_end = t_gen
-        status = "CLAMPED"
-    else:
-        t_end = t_end_raw
-        status = "OK"
-    t_use = max(t_end - t_start, 0.0)
-    n_per = t_use / T if t_use > 0 else 0.0
+    c = omega / result.k
+    t_ana = max(result.t_analysis_end_s - result.t_analysis_start_s, 0.0)
+    n_per = t_ana / T if t_ana > 0 else 0.0
+    status = "CLAMPED" if result.runtime_capped else "OK"
     if 0 < n_per < 5:
         status += "_FEW"
     if not result.singularity_ok:
         status += "+SING"
     return {
         "test_id": result.test_id,
-        "f": f, "T": T, "L": L, "c": c, "cg": cg,
-        "t_gen": t_gen, "t_start": t_start, "t_end": t_end,
-        "t_use": t_use, "n_per": n_per,
+        "f": f, "T": T, "L": result.wavelength_m,
+        "c": c, "cg": result.cg_m_s,
+        "t_gen": meta.t_gen_s,
+        "t_start": result.t_start_s,
+        "t_end": result.t_end_s,
+        "t_ana_start": result.t_analysis_start_s,
+        "t_ana_end": result.t_analysis_end_s,
+        "head_drop": result.head_drop_s,
+        "tail_drop": result.tail_drop_s,
+        "t_use": t_ana, "n_per": n_per,
         "H_I": result.H_I, "H_R": result.H_R, "Kr": result.Kr,
         "status": status, "singularity_ok": result.singularity_ok,
     }
@@ -85,14 +74,19 @@ _CHART_DEFAULTS = (
 )
 
 _CSS = """
+@font-face {
+  font-family:'ReportDigits';
+  src:local('Times New Roman'),local('TimesNewRomanPSMT'),local('Times');
+  unicode-range:U+0030-0039;
+}
 :root {
   --color-background-primary:#ffffff;--color-background-secondary:#f5f5f2;
   --color-background-success:#EAF3DE;--color-background-warning:#FAEEDA;
   --color-background-danger:#FCEBEB;--color-text-primary:#1a1a1a;
   --color-text-secondary:#5f5e5a;--color-border-tertiary:rgba(0,0,0,0.15);
   --color-border-secondary:rgba(0,0,0,0.3);
-  --font-sans:'Galaxie Copernicus','Copernicus',Georgia,'Times New Roman',serif;
-  --font-mono:'SF Mono','Consolas','Courier New',monospace;
+  --font-sans:'ReportDigits','Galaxie Copernicus','Copernicus',Georgia,'Times New Roman',serif;
+  --font-mono:'ReportDigits','SF Mono','Consolas','Courier New',monospace;
   --border-radius-md:8px;--border-radius-lg:12px;
 }
 @media (prefers-color-scheme: dark) {
@@ -173,6 +167,7 @@ def _table(rows: list[dict]) -> str:
     headers = [
         "test_id", "f (Hz)", "T (s)", "L (m)", "c (m/s)", "c<sub>g</sub> (m/s)",
         "t<sub>gen</sub> (s)", "t<sub>start</sub> (s)", "t<sub>end</sub> (s)",
+        "head drop (s)", "tail drop (s)",
         "T<sub>usable</sub> (s)", "N<sub>per</sub>",
         "H<sub>I</sub> (m)", "H<sub>R</sub> (m)", "K<sub>r</sub>", "Status",
     ]
@@ -190,6 +185,7 @@ def _table(rows: list[dict]) -> str:
             f"{r['c']:.3f}", f"{r['cg']:.3f}", t_gen_cell,
             f"{r['t_start']:.1f}",
             f"{r['t_end']:.1f}" if r["t_use"] > 0 else "—",
+            f"{r['head_drop']:.1f}", f"{r['tail_drop']:.1f}",
             f"{r['t_use']:.1f}" if r["t_use"] > 0 else "—",
             f"{r['n_per']:.1f}" if r["n_per"] > 0 else "—",
             f"{r['H_I']:.4f}", f"{r['H_R']:.4f}", f"{r['Kr']:.3f}",
@@ -222,6 +218,8 @@ def _gantt_canvas(rows: list[dict]) -> str:
         {
             "f": r["f"], "t_gen": r["t_gen"],
             "t_start": r["t_start"], "t_end": r["t_end"],
+            "t_ana_start": r["t_ana_start"], "t_ana_end": r["t_ana_end"],
+            "head_drop": r["head_drop"], "tail_drop": r["tail_drop"],
             "t_use": r["t_use"], "n_per": r["n_per"],
             "status": r["status"],
         }
@@ -235,9 +233,11 @@ def _gantt_canvas(rows: list[dict]) -> str:
         '<span><span style="display:inline-block;width:10px;height:10px;'
         'background:rgba(136,135,128,0.3);margin-right:4px;"></span>Wait for reflections</span>'
         '<span><span style="display:inline-block;width:10px;height:10px;'
-        'background:rgba(50,102,173,0.45);margin-right:4px;"></span>Usable (OK)</span>'
+        'background:rgba(186,117,23,0.25);margin-right:4px;"></span>Head / tail drop</span>'
         '<span><span style="display:inline-block;width:10px;height:10px;'
-        'background:rgba(186,117,23,0.45);margin-right:4px;"></span>Usable (clamped)</span>'
+        'background:rgba(50,102,173,0.6);margin-right:4px;"></span>Analysis window (OK)</span>'
+        '<span><span style="display:inline-block;width:10px;height:10px;'
+        'background:rgba(186,117,23,0.6);margin-right:4px;"></span>Analysis window (clamped)</span>'
         '<span><span style="display:inline-block;width:2px;height:10px;'
         'background:#E24B4A;margin-right:4px;"></span>180 s limit</span>'
         '<span><span style="display:inline-block;width:2px;height:10px;'
@@ -254,9 +254,11 @@ def _gantt_canvas(rows: list[dict]) -> str:
   const rows = {payload};
   const labels = rows.map(r => r.f.toFixed(2));
   const waitData = rows.map(r => r.t_use > 0 ? [0, r.t_start] : null);
-  const useData  = rows.map(r => r.t_use > 0 ? [r.t_start, r.t_end] : null);
-  const useFills = rows.map(r => r.status.startsWith('OK') ? 'rgba(50,102,173,0.45)' : 'rgba(186,117,23,0.45)');
-  const useEdges = rows.map(r => r.status.startsWith('OK') ? '#3266ad' : '#BA7517');
+  const headData = rows.map(r => r.t_use > 0 && r.head_drop > 0 ? [r.t_start, r.t_ana_start] : null);
+  const anaData  = rows.map(r => r.t_use > 0 ? [r.t_ana_start, r.t_ana_end] : null);
+  const tailData = rows.map(r => r.t_use > 0 && r.tail_drop > 0 ? [r.t_ana_end, r.t_end] : null);
+  const anaFills = rows.map(r => r.status.startsWith('OK') ? 'rgba(50,102,173,0.6)' : 'rgba(186,117,23,0.6)');
+  const anaEdges = rows.map(r => r.status.startsWith('OK') ? '#3266ad' : '#BA7517');
   const tGens = Array.from(new Set(rows.map(r => r.t_gen).filter(v => v!=null))).sort((a,b)=>a-b);
   const limitColors = {{180:'#E24B4A', 240:'#534AB7'}};
   const maxX = Math.max(...rows.map(r=>r.t_end||0), ...tGens, 1) * 1.05;
@@ -266,7 +268,13 @@ def _gantt_canvas(rows: list[dict]) -> str:
       {{label:'Wait', data:waitData,
         backgroundColor:'rgba(136,135,128,0.2)', borderColor:'rgba(136,135,128,0.4)',
         borderWidth:1, borderSkipped:false}},
-      {{label:'Usable', data:useData, backgroundColor:useFills, borderColor:useEdges,
+      {{label:'Head drop', data:headData,
+        backgroundColor:'rgba(186,117,23,0.25)', borderColor:'rgba(186,117,23,0.6)',
+        borderWidth:1, borderSkipped:false}},
+      {{label:'Analysis', data:anaData, backgroundColor:anaFills, borderColor:anaEdges,
+        borderWidth:1, borderSkipped:false}},
+      {{label:'Tail drop', data:tailData,
+        backgroundColor:'rgba(186,117,23,0.25)', borderColor:'rgba(186,117,23,0.6)',
         borderWidth:1, borderSkipped:false}}
     ]}},
     options:{{
@@ -279,10 +287,15 @@ def _gantt_canvas(rows: list[dict]) -> str:
             const r = rows[ctx.dataIndex];
             if(!ctx.raw) return ctx.dataset.label+': —';
             const [a,b] = ctx.raw;
-            if(ctx.dataset.label==='Usable')
-              return ['Usable: '+a.toFixed(1)+' → '+b.toFixed(1)+' s',
+            const name = ctx.dataset.label;
+            if(name==='Analysis')
+              return ['Analysis: '+a.toFixed(1)+' → '+b.toFixed(1)+' s',
                       'T_use = '+r.t_use.toFixed(1)+' s  ('+r.n_per.toFixed(1)+' periods)',
                       'Status: '+r.status];
+            if(name==='Head drop')
+              return 'Head drop: '+a.toFixed(1)+' → '+b.toFixed(1)+' s  ('+r.head_drop.toFixed(1)+' s)';
+            if(name==='Tail drop')
+              return 'Tail drop: '+a.toFixed(1)+' → '+b.toFixed(1)+' s  ('+r.tail_drop.toFixed(1)+' s)';
             return 'Wait: 0 → '+b.toFixed(1)+' s';
           }}
         }}}}
@@ -398,7 +411,6 @@ def write_rw_report(
     out_dir: Path,
     method: str,
     csv_path: Path | None = None,
-    png_path: Path | None = None,
     timestamp: str | None = None,
 ) -> Path:
     """Write ``rw_report_<method>.html`` into ``out_dir`` and return its path.

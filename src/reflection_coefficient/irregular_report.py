@@ -20,9 +20,9 @@ from pathlib import Path
 
 import numpy as np
 
-from .analysis import group_velocity, solve_dispersion, solve_dispersion_array
+from .analysis import solve_dispersion, solve_dispersion_array
 from .io import TestMeta
-from .pipeline import IrregularResult, clip_bounds
+from .pipeline import IrregularResult
 
 # Re-use the stylesheet + tank SVG + geometry cards + chart bootstrap from rw_report.
 from .rw_report import (  # noqa: F401
@@ -35,25 +35,145 @@ from .rw_report import (  # noqa: F401
 
 
 def _window_info(result: IrregularResult, meta: TestMeta) -> dict:
+    """Read the time-window and band metadata straight from the pipeline's
+    diagnostics so the report cannot drift from what the analysis used."""
+    d = result.diagnostics
     depth = meta.water_depth_m
     g = meta.gravity_m_s2
-    f_peak = result.diagnostics["f_peak_used_Hz"]
-    # Metadata band (WN) takes precedence; fall back to ±peak-factor (JS/§7).
+    f_peak = float(d["f_peak_used_Hz"])
     f_lo = meta.f_min_Hz if meta.f_min_Hz else 0.5 * f_peak
     f_hi = meta.f_max_Hz if meta.f_max_Hz else 2.5 * f_peak
-    cg_slow = group_velocity(f_lo, depth, g=g)
-    cg_fast = group_velocity(f_hi, depth, g=g)
-    t_start, _ = clip_bounds(cg_slow, meta.x_paddle_to_wp1_m,
-                             meta.x_wp3_to_struct_m, meta.X13_m)
-    _, t_end = clip_bounds(cg_fast, meta.x_paddle_to_wp1_m,
-                           meta.x_wp3_to_struct_m, meta.X13_m)
     _, L_peak = solve_dispersion(f_peak, depth, g=g)
     return {
-        "f_peak": f_peak, "f_lo": f_lo, "f_hi": f_hi,
-        "cg_slow": cg_slow, "cg_fast": cg_fast,
-        "t_start": float(t_start), "t_end": float(t_end),
-        "L_peak": L_peak,
+        "f_peak": f_peak, "f_lo": float(f_lo), "f_hi": float(f_hi),
+        "t_start": float(d["t_start_s"]),
+        "t_end": float(d["t_end_s"]),
+        "t_ana_start": float(d.get("t_analysis_start_s", d["t_start_s"])),
+        "t_ana_end": float(d.get("t_analysis_end_s", d["t_end_s"])),
+        "head_drop": float(d.get("head_drop_s", 0.0)),
+        "tail_drop": float(d.get("tail_drop_s", 0.0)),
+        "t_gen": meta.t_gen_s,
+        "record_tail": float(d["record_tail_s"]),
+        "runtime_bound": float(d["runtime_bound_s"]),
+        "runtime_capped": bool(d["runtime_capped"]),
+        "cg_fastest": float(d["cg_fastest_m_s"]),
+        "cg_slowest": float(d["cg_slowest_m_s"]),
+        "L_peak": float(L_peak),
     }
+
+
+def _window_timeline_canvas(win: dict) -> str:
+    """Single-row Gantt timeline for this test's clip window.
+
+    Shows [0 → t_start] (wait for first reflection) and
+    [t_start → t_end] (usable segment), plus dashed vertical markers at
+    ``t_gen_s`` (paddle stop) and the record tail.
+    """
+    t_ana = max(win["t_ana_end"] - win["t_ana_start"], 0.0)
+    T_p = 1.0 / win["f_peak"] if win["f_peak"] > 0 else float("nan")
+    n_per = t_ana / T_p if T_p > 0 else 0.0
+    status = "CLAMPED" if win["runtime_capped"] else "OK"
+    ana_color = "rgba(186,117,23,0.6)" if win["runtime_capped"] else "rgba(50,102,173,0.6)"
+    ana_edge = "#BA7517" if win["runtime_capped"] else "#3266ad"
+
+    payload = json.dumps({
+        "t_start": win["t_start"], "t_end": win["t_end"],
+        "t_ana_start": win["t_ana_start"], "t_ana_end": win["t_ana_end"],
+        "head_drop": win["head_drop"], "tail_drop": win["tail_drop"],
+        "t_gen": win["t_gen"], "tail": win["record_tail"],
+        "t_ana": t_ana, "n_per": n_per, "status": status,
+        "ana_color": ana_color, "ana_edge": ana_edge,
+    })
+    script = f"""(function(){{
+  const d = {payload};
+  const markers = [];
+  if (d.t_gen != null) markers.push({{x:d.t_gen, color:'#E24B4A', label:'t_gen = '+d.t_gen+' s'}});
+  markers.push({{x:d.tail, color:'#534AB7', label:'record tail = '+d.tail.toFixed(1)+' s'}});
+  const maxX = Math.max(d.t_end, d.tail, d.t_gen||0) * 1.05;
+  new Chart(document.getElementById('winChart'), {{
+    type:'bar',
+    data:{{labels:[''], datasets:[
+      {{label:'Wait', data:[[0, d.t_start]],
+        backgroundColor:'rgba(136,135,128,0.2)', borderColor:'rgba(136,135,128,0.4)',
+        borderWidth:1, borderSkipped:false}},
+      {{label:'Head drop',
+        data:[d.head_drop > 0 ? [d.t_start, d.t_ana_start] : null],
+        backgroundColor:'rgba(186,117,23,0.25)', borderColor:'rgba(186,117,23,0.6)',
+        borderWidth:1, borderSkipped:false}},
+      {{label:'Analysis', data:[[d.t_ana_start, d.t_ana_end]],
+        backgroundColor:d.ana_color, borderColor:d.ana_edge,
+        borderWidth:1, borderSkipped:false}},
+      {{label:'Tail drop',
+        data:[d.tail_drop > 0 ? [d.t_ana_end, d.t_end] : null],
+        backgroundColor:'rgba(186,117,23,0.25)', borderColor:'rgba(186,117,23,0.6)',
+        borderWidth:1, borderSkipped:false}}
+    ]}},
+    options:{{
+      responsive:true, maintainAspectRatio:false, indexAxis:'y',
+      plugins:{{
+        legend:{{display:false}},
+        tooltip:{{callbacks:{{
+          label:(ctx)=>{{
+            if(!ctx.raw) return ctx.dataset.label+': —';
+            const [a,b] = ctx.raw;
+            const name = ctx.dataset.label;
+            if(name==='Analysis')
+              return ['Analysis: '+a.toFixed(1)+' → '+b.toFixed(1)+' s',
+                      'T_use = '+d.t_ana.toFixed(1)+' s  ('+d.n_per.toFixed(1)+' T_p)',
+                      'Status: '+d.status];
+            if(name==='Head drop')
+              return 'Head drop: '+a.toFixed(1)+' → '+b.toFixed(1)+' s  ('+d.head_drop.toFixed(1)+' s)';
+            if(name==='Tail drop')
+              return 'Tail drop: '+a.toFixed(1)+' → '+b.toFixed(1)+' s  ('+d.tail_drop.toFixed(1)+' s)';
+            return 'Wait: 0 → '+b.toFixed(1)+' s';
+          }}
+        }}}}
+      }},
+      scales:{{
+        x:{{title:{{display:true,text:'Time (s)'}}, min:0, max:maxX}},
+        y:{{display:false}}
+      }}
+    }},
+    plugins:[{{
+      id:'tMarkers',
+      afterDraw(chart){{
+        const ctx = chart.ctx, xS = chart.scales.x, area = chart.chartArea;
+        markers.forEach(m => {{
+          const x = xS.getPixelForValue(m.x);
+          ctx.save();
+          ctx.strokeStyle = m.color; ctx.lineWidth = 1.5; ctx.setLineDash([5,3]);
+          ctx.beginPath(); ctx.moveTo(x, area.top); ctx.lineTo(x, area.bottom); ctx.stroke();
+          ctx.restore();
+          ctx.fillStyle = m.color;
+          ctx.font = '10px ' + getComputedStyle(document.body).fontFamily;
+          ctx.fillText(m.label, x+4, area.top+10);
+        }});
+      }}
+    }}]
+  }});
+}})();"""
+    legend = (
+        '<div style="display:flex;flex-wrap:wrap;gap:16px;margin:8px 0 0;'
+        'font-size:12px;color:var(--color-text-secondary);">'
+        '<span><span style="display:inline-block;width:10px;height:10px;'
+        'background:rgba(136,135,128,0.3);margin-right:4px;"></span>Wait for reflections</span>'
+        '<span><span style="display:inline-block;width:10px;height:10px;'
+        'background:rgba(186,117,23,0.25);margin-right:4px;"></span>Head / tail drop</span>'
+        f'<span><span style="display:inline-block;width:10px;height:10px;'
+        f'background:{ana_color};margin-right:4px;"></span>Analysis ({status.lower()})</span>'
+        '<span><span style="display:inline-block;width:2px;height:10px;'
+        'background:#E24B4A;margin-right:4px;"></span>t_gen</span>'
+        '<span><span style="display:inline-block;width:2px;height:10px;'
+        'background:#534AB7;margin-right:4px;"></span>record tail</span>'
+        '</div>'
+    )
+    return (
+        '<div style="position:relative;width:100%;height:140px;'
+        'background:var(--color-background-secondary);'
+        'border-radius:var(--border-radius-md);padding:0.75rem;">'
+        '<canvas id="winChart"></canvas></div>'
+        f'<script>{script}</script>{legend}'
+    )
 
 
 def _chart_wrap(canvas_id: str, height_px: int, inner_script: str) -> str:
@@ -272,6 +392,8 @@ def _summary_cards(result: IrregularResult, win: dict) -> str:
         ("L at f<sub>peak</sub>", f"{win['L_peak']:.2f} m"),
         ("Clip t<sub>start</sub> / t<sub>end</sub>",
          f"{win['t_start']:.1f} / {win['t_end']:.1f} s"),
+        ("Head / tail drop",
+         f"{win['head_drop']:g} / {win['tail_drop']:g} s"),
         ("H<sub>m0,I</sub>", f"{result.Hm0_I:.4f} m"),
         ("H<sub>m0,R</sub>", f"{result.Hm0_R:.4f} m"),
         ("T<sub>p,I</sub>", f"{result.Tp_I:.3f} s" if np.isfinite(result.Tp_I) else "—"),
@@ -338,6 +460,8 @@ def write_irregular_report(
         _geometry_cards(meta, geo_rows),
         "<h2>Summary</h2>",
         _summary_cards(result, win),
+        "<h2>Time-window breakdown</h2>",
+        _window_timeline_canvas(win),
         "<h2>Incident & reflected spectra</h2>",
         _spectra_canvas(result, win),
         "<h2>K<sub>r</sub>(f)</h2>",

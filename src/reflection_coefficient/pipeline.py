@@ -88,6 +88,16 @@ class RegularResult:
     H_R: float
     Kr: float
     singularity_ok: bool
+    cg_m_s: float = 0.0
+    t_start_s: float = 0.0
+    t_end_s: float = 0.0
+    t_end_physics_s: float = 0.0
+    runtime_bound_s: float = 0.0
+    runtime_capped: bool = False
+    head_drop_s: float = 0.0
+    tail_drop_s: float = 0.0
+    t_analysis_start_s: float = 0.0
+    t_analysis_end_s: float = 0.0
 
 
 @dataclass
@@ -121,6 +131,8 @@ def analyse_regular(
     eta3: np.ndarray,
     meta: TestMeta,
     method: MethodName = "least_squares",
+    head_drop_s: float = 0.0,
+    tail_drop_s: float = 0.0,
 ) -> RegularResult:
     if meta.f_Hz is None:
         raise ValueError(f"{meta.test_id}: regular-wave analysis requires meta.f_Hz")
@@ -129,9 +141,46 @@ def analyse_regular(
     g = meta.gravity_m_s2
 
     cg = group_velocity(meta.f_Hz, depth, g=g)
-    t_start, t_end = clip_bounds(cg, x_paddle, x_struct, X13)
+    t_start, t_end_physics = clip_bounds(cg, x_paddle, x_struct, X13)
 
-    t_c, e1, e2, e3 = clip_window(t, eta1, eta2, eta3, t_start=t_start, t_end=t_end)
+    # Runtime cap: hard upper bound is the record tail; if t_gen_s is known,
+    # extend it to t_gen_s + x_paddle/cg — the last incident crest generated
+    # at paddle-stop passes wp1 at that time and is still valid for the
+    # separation. Effective t_end is the tighter of the physics bound and
+    # the runtime-extended bound.
+    record_tail = float(t[-1])
+    if meta.t_gen_s is not None:
+        runtime_bound = min(record_tail, float(meta.t_gen_s) + x_paddle / cg)
+    else:
+        runtime_bound = record_tail
+    t_end = min(t_end_physics, runtime_bound)
+    runtime_capped = runtime_bound < t_end_physics
+
+    if t_end <= t_start:
+        raise ValueError(
+            f"{meta.test_id}: clip window collapses "
+            f"(t_start={t_start:.2f} s, t_end={t_end:.2f} s, "
+            f"runtime_bound={runtime_bound:.2f} s). "
+            f"Generated signal too short for the chosen geometry."
+        )
+
+    # Analysis bounds: user-configurable head/tail drop applied inside the
+    # reflection-clean window, so the FFT never sees the ramp-up/ramp-down
+    # transients that typically bracket the usable range.
+    head_drop_s = max(float(head_drop_s), 0.0)
+    tail_drop_s = max(float(tail_drop_s), 0.0)
+    t_ana_start = t_start + head_drop_s
+    t_ana_end = t_end - tail_drop_s
+    if t_ana_end <= t_ana_start:
+        raise ValueError(
+            f"{meta.test_id}: head/tail drops collapse the analysis window "
+            f"(t_start={t_start:.2f} s, t_end={t_end:.2f} s, "
+            f"head_drop={head_drop_s:g} s, tail_drop={tail_drop_s:g} s)."
+        )
+
+    t_c, e1, e2, e3 = clip_window(
+        t, eta1, eta2, eta3, t_start=t_ana_start, t_end=t_ana_end
+    )
     if t_c.size < 8:
         raise ValueError(
             f"{meta.test_id}: clip window [{t_start:.2f}, {t_end:.2f}] s "
@@ -188,6 +237,16 @@ def analyse_regular(
         H_R=2.0 * a_R,
         Kr=Kr,
         singularity_ok=bool(valid[0]),
+        cg_m_s=float(cg),
+        t_start_s=float(t_start),
+        t_end_s=float(t_end),
+        t_end_physics_s=float(t_end_physics),
+        runtime_bound_s=float(runtime_bound),
+        runtime_capped=bool(runtime_capped),
+        head_drop_s=float(head_drop_s),
+        tail_drop_s=float(tail_drop_s),
+        t_analysis_start_s=float(t_ana_start),
+        t_analysis_end_s=float(t_ana_end),
     )
 
 
@@ -215,14 +274,19 @@ def analyse_irregular(
     band_hi_factor: float = 2.5,
     window: str = "hann",
     bandwidth_Hz: float | None = None,
+    head_drop_s: float = 0.0,
+    tail_drop_s: float = 0.0,
 ) -> IrregularResult:
     """Irregular-wave reflection analysis (white-noise or JONSWAP).
 
-    ``f_peak`` is used to size the clipping window (via slowest-frequency
-    group velocity) and to define the valid analysis band
+    ``f_peak`` defines the valid analysis band
     ``[band_lo_factor·f_peak, band_hi_factor·f_peak]``. If omitted, it is
     inferred from metadata: ``1/Tp_target_s`` for JONSWAP, or the midpoint of
-    ``[f_min_Hz, f_max_Hz]`` for white noise.
+    ``[f_min_Hz, f_max_Hz]`` for white noise. The time-window follows the
+    Goda-Suzuki / Mansard-Funke convention: ``t_start`` from the slowest-cg
+    first-reflection arrival, ``t_end`` from the runtime bound (record tail
+    or ``t_gen_s + x_paddle/cg_fastest``), with partial re-reflections left
+    to the spectral separation rather than time-gated out.
     """
     x_paddle, x_struct, X12, X13 = _require_geometry(meta)
     depth = meta.water_depth_m
@@ -238,16 +302,59 @@ def analyse_irregular(
                 f"{meta.test_id}: cannot infer f_peak; pass f_peak explicitly"
             )
 
-    # Conservative window: slowest cg at f_min for t_start, fastest at f_max
-    # for t_end. Fall back to cg at f_peak if band edges are unavailable.
+    # t_start: earliest moment at which every frequency has a clean first
+    # reflection at every probe — slowest cg sets the latest arrival. In
+    # finite-depth water cg decreases with f, so the slowest cg sits at f_max
+    # and the fastest at f_min; compute both and pick via min/max for
+    # robustness across the shallow/deep transition.
     f_lo = meta.f_min_Hz or f_peak
     f_hi = meta.f_max_Hz or f_peak
-    cg_slow = group_velocity(f_lo, depth, g=g)
-    cg_fast = group_velocity(f_hi, depth, g=g)
-    t_start, _ = clip_bounds(cg_slow, x_paddle, x_struct, X13)
-    _, t_end = clip_bounds(cg_fast, x_paddle, x_struct, X13)
+    cg_lo = group_velocity(f_lo, depth, g=g)
+    cg_hi = group_velocity(f_hi, depth, g=g)
+    cg_fastest = max(cg_lo, cg_hi)
+    cg_slowest = min(cg_lo, cg_hi)
+    t_start, _ = clip_bounds(cg_slowest, x_paddle, x_struct, X13)
 
-    t_c, e1, e2, e3 = clip_window(t, eta1, eta2, eta3, t_start=t_start, t_end=t_end)
+    # t_end: follow the Goda-Suzuki / Mansard-Funke convention for random-wave
+    # records — take a long stationary segment and let the spectral/LSQ
+    # separation (plus the D > 0.1 singularity mask) handle partial re-
+    # reflections, rather than time-gating them out. Upper bound is the record
+    # tail; when meta.t_gen_s is known, tighten it to
+    # t_gen_s + x_paddle / cg_fastest, i.e. when the fastest component's last
+    # incident crest has passed wp1 (the first probe to lose incident content
+    # after the paddle stops).
+    record_tail = float(t[-1])
+    if meta.t_gen_s is not None:
+        runtime_bound = min(
+            record_tail, float(meta.t_gen_s) + x_paddle / cg_fastest
+        )
+    else:
+        runtime_bound = record_tail
+    t_end = runtime_bound
+    runtime_capped = runtime_bound < record_tail
+
+    if t_end <= t_start:
+        raise ValueError(
+            f"{meta.test_id}: clip window collapses "
+            f"(t_start={t_start:.2f} s, t_end={t_end:.2f} s, "
+            f"runtime_bound={runtime_bound:.2f} s). Generated signal too "
+            f"short for the chosen band / geometry."
+        )
+
+    # Optional user-configurable head/tail drop inside the clean window, to
+    # exclude ramp-up / ramp-down transients from the FFT.
+    head_drop_s = max(float(head_drop_s), 0.0)
+    tail_drop_s = max(float(tail_drop_s), 0.0)
+    t_ana_start = t_start + head_drop_s
+    t_ana_end = t_end - tail_drop_s
+    if t_ana_end <= t_ana_start:
+        raise ValueError(
+            f"{meta.test_id}: head/tail drops collapse the analysis window "
+            f"(t_start={t_start:.2f} s, t_end={t_end:.2f} s, "
+            f"head_drop={head_drop_s:g} s, tail_drop={tail_drop_s:g} s)."
+        )
+
+    t_c, e1, e2, e3 = clip_window(t, eta1, eta2, eta3, t_start=t_ana_start, t_end=t_ana_end)
     if t_c.size < 64:
         raise ValueError(
             f"{meta.test_id}: clip window too short ({t_c.size} samples)"
@@ -338,6 +445,15 @@ def analyse_irregular(
     diagnostics = {
         "t_start_s": t_start,
         "t_end_s": t_end,
+        "record_tail_s": record_tail,
+        "runtime_bound_s": runtime_bound,
+        "runtime_capped": bool(runtime_capped),
+        "head_drop_s": float(head_drop_s),
+        "tail_drop_s": float(tail_drop_s),
+        "t_analysis_start_s": float(t_ana_start),
+        "t_analysis_end_s": float(t_ana_end),
+        "cg_fastest_m_s": float(cg_fastest),
+        "cg_slowest_m_s": float(cg_slowest),
         "fs_Hz": float(fs),
         "N": int(N),
         "df_Hz": float(df),
@@ -378,11 +494,17 @@ def analyse(
     method: MethodName = "least_squares",
     window: str = "hann",
     bandwidth_Hz: float | None = None,
+    head_drop_s: float = 0.0,
+    tail_drop_s: float = 0.0,
 ) -> RegularResult | IrregularResult:
     """Dispatch to the regular or irregular path based on ``meta.campaign``."""
     if meta.campaign == "rw":
-        return analyse_regular(t, eta1, eta2, eta3, meta, method=method)
+        return analyse_regular(
+            t, eta1, eta2, eta3, meta, method=method,
+            head_drop_s=head_drop_s, tail_drop_s=tail_drop_s,
+        )
     return analyse_irregular(
         t, eta1, eta2, eta3, meta, method=method,
         window=window, bandwidth_Hz=bandwidth_Hz,
+        head_drop_s=head_drop_s, tail_drop_s=tail_drop_s,
     )
