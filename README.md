@@ -16,6 +16,7 @@ plus an energy-based `Kr_overall = sqrt(m0_R / m0_I)`.
 Reflection_Coefficient/
 ├── src/reflection_coefficient/
 │   ├── io.py                  # load tank config, metadata, raw txt
+│   ├── calibration.py         # linear probe re-calibration (side module)
 │   ├── preprocessing.py       # clip / detrend / Hann window
 │   ├── analysis.py            # FFT + dispersion solver
 │   ├── methods/
@@ -27,7 +28,7 @@ Reflection_Coefficient/
 │   └── utils.py
 ├── scripts/run_analysis.py    # CLI entry point
 ├── tests/                     # pytest suite
-├── experiment_data/           # tank_config.json, metadata/*.csv, raw RW###.txt / WN###.txt
+├── experiment_data/           # tank_config.json, probes.json, metadata/*.csv, raw RW###.txt / WN###.txt
 └── results/                   # generated output (gitignored)
 ```
 
@@ -60,11 +61,14 @@ python scripts/init_project.py
 ```
 
 This creates `experiment_data/tank_config.json` (placeholder geometry + water
-depth), empty `experiment_data/metadata/{rw,wn,js}.csv` with headers, and the
+depth), `experiment_data/probes.json` (per-probe re-calibration with identity
+defaults — see [Linear probe re-calibration](#linear-probe-re-calibration)),
+empty `experiment_data/metadata/{rw,wn,js}.csv` with headers, and the
 `experiment_data/{rw,wn,js}/` subfolders for raw probe txt files. Existing
 files are preserved unless you pass `--force`. Any of `--tank-config`,
-`--metadata-dir`, `--data-dir` can redirect the scaffold elsewhere, and those
-paths are persisted for subsequent `run_analysis.py` calls.
+`--metadata-dir`, `--data-dir`, `--probes-config` can redirect the scaffold
+elsewhere, and those paths are persisted for subsequent `run_analysis.py`
+calls.
 
 Then fill in the geometry fields in `tank_config.json`, add per-test rows to
 the metadata CSVs, and drop raw `<TEST_ID>.txt` files into `experiment_data/`
@@ -72,7 +76,7 @@ the metadata CSVs, and drop raw `<TEST_ID>.txt` files into `experiment_data/`
 
 ## CLI — `scripts/run_analysis.py`
 
-Three path inputs and three analysis choices are **persisted per-user** in
+Path inputs and analysis choices are **persisted per-user** in
 `~/.reflection_coefficient.json`. Priority for each: **CLI arg → stored value
 → built-in default**. Pass `--show-paths` to see what will be resolved.
 
@@ -83,6 +87,7 @@ Three path inputs and three analysis choices are **persisted per-user** in
 | `--tank-config PATH` | default: `experiment_data/tank_config.json` | ✔ | Tank geometry + water depth JSON. |
 | `--metadata-dir PATH` | default: `experiment_data/metadata/` | ✔ | Folder containing `rw.csv` / `wn.csv` / `js.csv`. |
 | `--data-dir PATH` | default: `experiment_data/` | ✔ | Folder holding raw `<TEST_ID>.txt` files. Accepts either `<data_dir>/<scheme>/<TEST_ID>.txt` (per-scheme subfolders) or `<data_dir>/<TEST_ID>.txt` (flat). |
+| `--probes-config PATH` | default: `experiment_data/probes.json` | ✔ | Per-probe linear re-calibration JSON. Consumed only when `--recalibrate` is on. |
 | `--scheme {rw,wn,js}` | *prompted if omitted* | — | Wave scheme. `rw` = regular, `wn` = white-noise irregular, `js` = JONSWAP irregular. |
 | `--test TEST_ID \| all` | default: `all` | — | Test id (e.g. `RW005`, `WN003`) or `all` to iterate every test in the scheme. `all` is only supported for `--scheme rw`. |
 | `--method {goda,least_squares}` | default: `least_squares` | ✔ | Separation method. Goda uses probes 1 & 3; Mansard–Funke uses all three. |
@@ -90,6 +95,7 @@ Three path inputs and three analysis choices are **persisted per-user** in
 | `--bandwidth HZ` | default: `0.04` | ✔ | Target resolution bandwidth in Hz for band-averaging (only meaningful with `--window hann`). |
 | `--head-drop SEC` | default: `3.0` | ✔ | Seconds to trim from the **start** of the clean analysis window, so the FFT skips ramp-up transients. |
 | `--tail-drop SEC` | default: `3.0` | ✔ | Seconds to trim from the **end** of the clean analysis window, so the FFT skips ramp-down transients. |
+| `--recalibrate` / `--no-recalibrate` | default: off | ✔ | Apply the per-probe linear re-calibration from `probes.json` after loading. See [Linear probe re-calibration](#linear-probe-re-calibration). |
 | `--output PATH` | default: `<project>/results` | — | Parent output dir. A timestamped subfolder `YYYYMMDD_HHMMSS/` is created per run. |
 | `--list` | flag | — | List discoverable tests for the chosen scheme and exit. |
 | `--show-paths` | flag | — | Print the resolved `tank_config` / `metadata_dir` / `data_dir` / `method` / `window` / drops and exit. |
@@ -121,6 +127,9 @@ python scripts/run_analysis.py --scheme wn --test WN003 \
 python scripts/run_analysis.py --scheme rw --test all \
     --head-drop 5 --tail-drop 5
 
+# Turn on linear probe re-calibration (remembered until --no-recalibrate)
+python scripts/run_analysis.py --scheme rw --test all --recalibrate
+
 # Inspect resolved configuration
 python scripts/run_analysis.py --show-paths
 
@@ -148,6 +157,46 @@ depend on scheme and selection:
 The HTML reports use **Chart.js** for interactive, tooltipped plots (Gantt of
 time windows, `Kr` vs frequency, incident/reflected spectra, singularity
 metric). They are self-contained — open directly in a browser.
+
+## Linear probe re-calibration
+
+A side-module (`reflection_coefficient.calibration`) that corrects probe
+elevations when a new gain/offset calibration supersedes the one used during
+acquisition. It is **not** applied by `load_probe_data`; turn it on with
+`--recalibrate` (persisted), and fill in `experiment_data/probes.json`.
+
+The acquisition system recorded `eta_old = scale_old · raw + offset_old`;
+the re-calibration target is `eta_new = scale_new · raw + offset_new`.
+Eliminating `raw` gives the closed-form transfer applied per probe:
+
+```
+eta_new = (scale_new / scale_old) · (eta_old − offset_old) + offset_new
+```
+
+Identity values (`scale_new == scale_old`, `offset_new == offset_old`) disable
+the transform for that probe. `probes.json` holds four numbers per probe:
+
+```jsonc
+{
+  "wp1": {"scale_old": 1.0, "offset_old": 0.0, "scale_new": 1.0, "offset_new": 0.0},
+  "wp2": {"scale_old": 1.0, "offset_old": 0.0, "scale_new": 1.0, "offset_new": 0.0},
+  "wp3": {"scale_old": 1.0, "offset_old": 0.0, "scale_new": 1.0, "offset_new": 0.0}
+}
+```
+
+Unit conventions: offsets share units with `eta` as returned by
+`load_probe_data` (metres); scale units cancel through the ratio, so use any
+unit consistent across old/new (e.g. mm per volt straight from a calibration
+sheet).
+
+Library entry points:
+
+```python
+from reflection_coefficient.calibration import (
+    apply_calibration_transfer,   # pure math on a single series
+    recalibrate_probes,           # applies it to eta1/eta2/eta3 using probes.json
+)
+```
 
 ## Library usage
 
