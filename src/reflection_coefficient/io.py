@@ -21,12 +21,16 @@ stored in metadata; they are computed by downstream stages from
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
 import numpy as np
 import pandas as pd
+
+_TIME_HEADER = re.compile(r"\s*time\s*", re.IGNORECASE)
+_PROBE_HEADER = re.compile(r"\s*\d+\s+wp\s*([123])\s*", re.IGNORECASE)
 
 Campaign = Literal["rw", "wn", "js"]
 CAMPAIGNS: tuple[str, ...] = ("rw", "wn", "js")
@@ -38,10 +42,11 @@ _PKG_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_TANK_CONFIG = _PKG_ROOT / "experiment_data" / "tank_config.json"
 DEFAULT_METADATA_DIR = _PKG_ROOT / "experiment_data" / "metadata"
 DEFAULT_DATA_DIR = _PKG_ROOT / "experiment_data"
+DEFAULT_PROBES_CONFIG = _PKG_ROOT / "experiment_data" / "probes.json"
 
 USER_CONFIG_PATH = _PKG_ROOT / ".reflection_coefficient.json"
 
-_PATH_KEYS = ("tank_config", "metadata_dir", "data_dir")
+_PATH_KEYS = ("tank_config", "metadata_dir", "data_dir", "probes_config")
 
 
 # ---------------------------------------------------------------------------
@@ -69,10 +74,13 @@ def save_paths(
     tank_config: Path | str | None = None,
     metadata_dir: Path | str | None = None,
     data_dir: Path | str | None = None,
+    probes_config: Path | str | None = None,
 ) -> None:
-    """Persist any of the three paths the user provided. ``None`` = leave alone."""
+    """Persist any of the four paths the user provided. ``None`` = leave alone."""
     cfg = _load_user_config()
-    for key, value in zip(_PATH_KEYS, (tank_config, metadata_dir, data_dir)):
+    for key, value in zip(
+        _PATH_KEYS, (tank_config, metadata_dir, data_dir, probes_config)
+    ):
         if value is not None:
             cfg[key] = str(Path(value).resolve())
     _save_user_config(cfg)
@@ -169,6 +177,24 @@ def resolve_data_dir(explicit: Path | str | None = None) -> Path:
     return _resolve("data_dir", explicit, DEFAULT_DATA_DIR)
 
 
+def resolve_probes_config(explicit: Path | str | None = None) -> Path:
+    return _resolve("probes_config", explicit, DEFAULT_PROBES_CONFIG)
+
+
+def save_recalibrate(flag: bool) -> None:
+    """Persist the on/off state of the linear probe re-calibration."""
+    cfg = _load_user_config()
+    cfg["recalibrate"] = bool(flag)
+    _save_user_config(cfg)
+
+
+def resolve_recalibrate(explicit: bool | None, default: bool = False) -> bool:
+    """Resolve the recalibration flag from CLI / stored / default."""
+    if explicit is not None:
+        return bool(explicit)
+    return bool(_load_user_config().get("recalibrate", default))
+
+
 # ---------------------------------------------------------------------------
 # Loading
 # ---------------------------------------------------------------------------
@@ -180,12 +206,66 @@ def load_tank_config(path: Path | str | None = None) -> dict:
         return json.load(f)
 
 
+def load_probes_config(path: Path | str | None = None) -> dict:
+    """Read the per-probe linear re-calibration config. Consumed only when
+    ``--recalibrate`` is on; structure is documented in the file's ``_doc``
+    field and validated by ``calibration.recalibrate_probes``."""
+    p = resolve_probes_config(path)
+    with open(p, encoding="utf-8") as f:
+        return json.load(f)
+
+
 def load_metadata(
     campaign: Campaign, metadata_dir: Path | str | None = None
 ) -> pd.DataFrame:
     """Return the per-test metadata table for a campaign, indexed by test_id."""
     d = resolve_metadata_dir(metadata_dir)
     return pd.read_csv(d / f"{campaign}.csv").set_index("test_id")
+
+
+def _parse_probe_header(path: Path) -> tuple[int, dict[int, int]]:
+    """Locate the Time and wp1/wp2/wp3 columns from a test file's first row.
+
+    Returns ``(time_col, {1: wp1_col, 2: wp2_col, 3: wp3_col})`` with zero-based
+    indices into the file's tab-separated column list. Extra instrument
+    columns (``Keyboard``, ``sonic``, etc.) are ignored so files with any
+    number or ordering of redundant columns load uniformly.
+    """
+    with open(path, encoding="utf-8", errors="replace") as f:
+        header_line = f.readline().rstrip("\r\n")
+    header = header_line.split("\t")
+
+    time_col: int | None = None
+    probe_cols: dict[int, int] = {}
+    for i, h in enumerate(header):
+        if _TIME_HEADER.fullmatch(h):
+            if time_col is not None:
+                raise ValueError(
+                    f"{path}: duplicate Time column in header {header!r}"
+                )
+            time_col = i
+            continue
+        m = _PROBE_HEADER.fullmatch(h)
+        if m:
+            p = int(m.group(1))
+            if p in probe_cols:
+                raise ValueError(
+                    f"{path}: duplicate wp{p} column in header {header!r}"
+                )
+            probe_cols[p] = i
+
+    missing: list[str] = []
+    if time_col is None:
+        missing.append("Time")
+    for p in (1, 2, 3):
+        if p not in probe_cols:
+            missing.append(f"wp{p}")
+    if missing:
+        raise ValueError(
+            f"{path}: header is missing required columns {missing}. "
+            f"Parsed header: {header!r}"
+        )
+    return time_col, probe_cols
 
 
 def _data_file(data_dir: Path, campaign: Campaign, test_id: str) -> Path:
@@ -347,22 +427,35 @@ def load_probe_data(
 
     path = _data_file(resolve_data_dir(data_dir), campaign, test_id)
 
-    # Tab-separated; two header rows (names, units). On-disk column order is
-    # time, keyboard, wp3, wp2, wp1 — note wp3 precedes wp1.
+    # Tab-separated; two header rows (names, units). The first row labels
+    # columns (e.g. "Time", "31 Keyboard", "4 sonic", "3 wp3", "2 wp2",
+    # "1 wp1") and redundant instrument columns vary between acquisition
+    # sessions — locate Time + wp1/wp2/wp3 by header name, not by position,
+    # so any number/ordering of other columns is tolerated.
+    time_col, probe_cols = _parse_probe_header(path)
+
     df = pd.read_csv(
         path,
         sep="\t",
         skiprows=2,
         header=None,
-        names=["time", "keyboard", "wp3", "wp2", "wp1"],
         engine="python",
     )
-    df = df.dropna(subset=["wp1", "wp2", "wp3"]).reset_index(drop=True)
 
-    t = df["time"].to_numpy(dtype=float)
-    eta1 = df["wp1"].to_numpy(dtype=float) / 1000.0
-    eta2 = df["wp2"].to_numpy(dtype=float) / 1000.0
-    eta3 = df["wp3"].to_numpy(dtype=float) / 1000.0
+    def _num(idx: int) -> np.ndarray:
+        return pd.to_numeric(df.iloc[:, idx], errors="coerce").to_numpy(dtype=float)
+
+    t_full = _num(time_col)
+    wp1_full = _num(probe_cols[1])
+    wp2_full = _num(probe_cols[2])
+    wp3_full = _num(probe_cols[3])
+
+    # Drop leading rows where the probes are not yet armed (blank cells).
+    mask = ~(np.isnan(wp1_full) | np.isnan(wp2_full) | np.isnan(wp3_full))
+    t = t_full[mask]
+    eta1 = wp1_full[mask] / 1000.0
+    eta2 = wp2_full[mask] / 1000.0
+    eta3 = wp3_full[mask] / 1000.0
 
     config = load_tank_config(tank_config)
     table = load_metadata(campaign, metadata_dir)

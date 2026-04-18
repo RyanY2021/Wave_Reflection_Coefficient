@@ -20,19 +20,24 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+from reflection_coefficient.calibration import recalibrate_probes
 from reflection_coefficient.io import (
     USER_CONFIG_PATH,
     list_tests,
     load_probe_data,
+    load_probes_config,
     resolve_data_dir,
     resolve_drops,
     resolve_metadata_dir,
     resolve_method,
+    resolve_probes_config,
+    resolve_recalibrate,
     resolve_tank_config,
     resolve_window,
     save_drops,
     save_method,
     save_paths,
+    save_recalibrate,
     save_window,
 )
 from reflection_coefficient.irregular_report import write_irregular_report
@@ -104,6 +109,23 @@ def main() -> None:
         help=(
             "Folder containing raw <TEST_ID>.txt files (flat or with "
             "rw/wn/js subfolders). Persisted when set."
+        ),
+    )
+    parser.add_argument(
+        "--probes-config", type=Path, default=None,
+        help=(
+            "Per-probe linear re-calibration JSON "
+            "(default: experiment_data/probes.json). Persisted when set. "
+            "Consumed only when --recalibrate is on."
+        ),
+    )
+    parser.add_argument(
+        "--recalibrate", default=None,
+        action=argparse.BooleanOptionalAction,
+        help=(
+            "Apply per-probe linear re-calibration from probes.json after "
+            "loading. Use --no-recalibrate to disable. Persisted when set "
+            "(default: off)."
         ),
     )
     parser.add_argument(
@@ -181,11 +203,14 @@ def _run(args) -> None:
 
     # Persist any explicitly provided paths before resolving (so the saved
     # values are available to later invocations regardless of errors below).
-    if any(v is not None for v in (args.tank_config, args.metadata_dir, args.data_dir)):
+    if any(v is not None for v in (
+        args.tank_config, args.metadata_dir, args.data_dir, args.probes_config,
+    )):
         save_paths(
             tank_config=args.tank_config,
             metadata_dir=args.metadata_dir,
             data_dir=args.data_dir,
+            probes_config=args.probes_config,
         )
         print(f"[run_analysis] updated saved paths in {USER_CONFIG_PATH}")
 
@@ -201,27 +226,45 @@ def _run(args) -> None:
         save_drops(head_drop_s=args.head_drop, tail_drop_s=args.tail_drop)
     args.head_drop, args.tail_drop = resolve_drops(args.head_drop, args.tail_drop)
 
+    if args.recalibrate is not None:
+        save_recalibrate(args.recalibrate)
+    args.recalibrate = resolve_recalibrate(args.recalibrate)
+
     tank_cfg = resolve_tank_config(args.tank_config)
     meta_dir = resolve_metadata_dir(args.metadata_dir)
     data_dir = resolve_data_dir(args.data_dir)
+    probes_cfg_path = resolve_probes_config(args.probes_config)
 
     if args.show_paths:
-        print(f"  tank_config  = {tank_cfg}")
-        print(f"  metadata_dir = {meta_dir}")
-        print(f"  data_dir     = {data_dir}")
-        print(f"  method       = {args.method}")
+        print(f"  tank_config   = {tank_cfg}")
+        print(f"  metadata_dir  = {meta_dir}")
+        print(f"  data_dir      = {data_dir}")
+        print(f"  probes_config = {probes_cfg_path}")
+        print(f"  method        = {args.method}")
         bw_txt = f"{args.bandwidth:g} Hz" if args.bandwidth is not None else "—"
-        print(f"  window       = {args.window}  (bandwidth: {bw_txt})")
+        print(f"  window        = {args.window}  (bandwidth: {bw_txt})")
         print(
-            f"  drops        = head {args.head_drop:g} s, "
+            f"  drops         = head {args.head_drop:g} s, "
             f"tail {args.tail_drop:g} s"
         )
+        print(f"  recalibrate   = {'on' if args.recalibrate else 'off'}")
         return
 
     for label, p in [("tank_config", tank_cfg), ("metadata_dir", meta_dir), ("data_dir", data_dir)]:
         if not p.exists():
             print(f"[run_analysis] {label} does not exist: {p}", file=sys.stderr)
             sys.exit(1)
+
+    probes_cfg = None
+    if args.recalibrate:
+        if not probes_cfg_path.exists():
+            print(
+                f"[run_analysis] --recalibrate requires a probes config at "
+                f"{probes_cfg_path} (run scripts/init_project.py to scaffold it).",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        probes_cfg = load_probes_config(probes_cfg_path)
 
     scheme = args.scheme or _prompt_choice(
         "Select wave scheme for this run:", ("rw", "wn", "js")
@@ -232,6 +275,7 @@ def _run(args) -> None:
         f" {SCHEME_LABELS[scheme]} | method={args.method} "
         f"| window={args.window} (bw {bw_txt}) "
         f"| drops head {args.head_drop:g}s tail {args.tail_drop:g}s "
+        f"| recalibrate={'on' if args.recalibrate else 'off'} "
     )
     print("=" * len(banner))
     print(banner)
@@ -277,6 +321,8 @@ def _run(args) -> None:
             tid, campaign=scheme,
             tank_config=tank_cfg, metadata_dir=meta_dir, data_dir=data_dir,
         )
+        if probes_cfg is not None:
+            eta1, eta2, eta3 = recalibrate_probes(eta1, eta2, eta3, probes_cfg)
         print(f"[run_analysis] {tid}: N={len(t)}, fs≈{1/(t[1]-t[0]):.1f} Hz")
         try:
             result = analyse(
