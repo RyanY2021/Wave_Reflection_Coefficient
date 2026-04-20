@@ -289,6 +289,35 @@ p, li, label, span, div { color: var(--ink); }
   font-size: var(--text-2xs) !important;
 }
 
+/* dropdown popover (the panel that opens when a selectbox is clicked) —
+   BaseWeb renders it in a portal outside the widget tree, so it has to be
+   targeted globally. Without these rules it picks up Streamlit's default
+   palette and reads white-on-white in light mode. */
+[data-baseweb="popover"] [role="listbox"],
+[data-baseweb="menu"] ul,
+div[data-baseweb="popover"] > div > div {
+  background: var(--surface) !important;
+  color: var(--ink) !important;
+  border: 1px solid var(--rule) !important;
+  border-radius: 2px !important;
+  box-shadow: 0 6px 18px -8px color-mix(in oklch, var(--ink) 22%, transparent) !important;
+  font-family: var(--font-serif) !important;
+  font-size: var(--text-sm) !important;
+}
+[data-baseweb="popover"] [role="option"],
+[data-baseweb="menu"] li {
+  background: var(--surface) !important;
+  color: var(--ink) !important;
+  font-family: var(--font-serif) !important;
+}
+[data-baseweb="popover"] [role="option"]:hover,
+[data-baseweb="menu"] li:hover,
+[data-baseweb="popover"] [role="option"][aria-selected="true"],
+[data-baseweb="menu"] li[aria-selected="true"] {
+  background: var(--surface-2) !important;
+  color: var(--ink) !important;
+}
+
 /* radio group — horizontal segmented */
 [role="radiogroup"] {
   gap: var(--space-1) !important;
@@ -488,22 +517,124 @@ p, li, label, span, div { color: var(--ink); }
   color: var(--ink-faint);
 }
 
-/* expander (log strip) */
-[data-testid="stExpander"] {
+/* expander (log strip) — Streamlit paints the <summary> header dark once
+   the details element is open, and recent versions wrap the header in a
+   <button>/<details> whose background flips on hover. Hold every layer on
+   the surface tokens so neither open-state nor hover repaints it black. */
+[data-testid="stExpander"],
+[data-testid="stExpander"] > details,
+[data-testid="stExpander"] > details[open] {
   border: none !important;
   border-top: 1px solid var(--rule) !important;
   border-radius: 0 !important;
   background: transparent !important;
+  background-color: transparent !important;
   margin-top: var(--space-6) !important;
+  box-shadow: none !important;
 }
 [data-testid="stExpander"] summary,
-[data-testid="stExpander"] > details > summary {
+[data-testid="stExpander"] > details > summary,
+[data-testid="stExpander"] > details[open] > summary,
+[data-testid="stExpander"] button,
+[data-testid="stExpander"] [data-testid="stExpanderToggle"],
+[data-testid="stExpander"] [data-testid="stExpanderHeader"] {
+  background: transparent !important;
+  background-color: transparent !important;
+  color: var(--ink-faint) !important;
   font-family: var(--font-mono) !important;
   font-size: var(--text-2xs) !important;
   letter-spacing: 0.08em !important;
   text-transform: uppercase !important;
-  color: var(--ink-faint) !important;
   padding: var(--space-3) var(--space-1) !important;
+  box-shadow: none !important;
+  border: none !important;
+}
+[data-testid="stExpander"] summary:hover,
+[data-testid="stExpander"] > details > summary:hover,
+[data-testid="stExpander"] > details[open] > summary:hover,
+[data-testid="stExpander"] button:hover,
+[data-testid="stExpander"] [data-testid="stExpanderToggle"]:hover,
+[data-testid="stExpander"] [data-testid="stExpanderHeader"]:hover {
+  background: var(--surface) !important;
+  background-color: var(--surface) !important;
+  color: var(--ink) !important;
+}
+[data-testid="stExpander"] summary svg,
+[data-testid="stExpander"] button svg {
+  fill: currentColor !important;
+  stroke: currentColor !important;
+}
+[data-testid="stExpander"] [data-testid="stExpanderDetails"] {
+  background: transparent !important;
+  background-color: transparent !important;
+}
+
+/* st.code block (log pane inside the expander) — Streamlit's default theme
+   ships a dark Prism background that fights the cream light palette. Force
+   it onto our surface tokens so the log reads cleanly in both modes, and
+   hold that background on :hover too (Streamlit's base CSS flips it dark
+   when the pointer enters the block). */
+[data-testid="stCode"],
+[data-testid="stCodeBlock"],
+[data-testid="stCode"]:hover,
+[data-testid="stCodeBlock"]:hover {
+  background: var(--surface) !important;
+  border: 1px solid var(--rule) !important;
+  border-radius: 2px !important;
+}
+[data-testid="stCode"] pre,
+[data-testid="stCodeBlock"] pre,
+[data-testid="stCode"] code,
+[data-testid="stCodeBlock"] code,
+[data-testid="stCode"] pre:hover,
+[data-testid="stCodeBlock"] pre:hover,
+[data-testid="stCode"] code:hover,
+[data-testid="stCodeBlock"] code:hover {
+  background: transparent !important;
+  color: var(--ink) !important;
+  font-family: var(--font-mono) !important;
+  font-size: var(--text-xs) !important;
+  line-height: var(--lh-xs) !important;
+}
+[data-testid="stCode"] span,
+[data-testid="stCodeBlock"] span {
+  color: inherit !important;
+  background: transparent !important;
+}
+/* Streamlit's copy button sits in an absolutely-positioned toolbar that
+   fades in on hover — its default dark chrome is what reads as "turns
+   black" when the pointer enters the log pane. Re-skin every layer of the
+   toolbar (and its pseudo-backgrounds) onto the surface tokens. */
+[data-testid="stCode"] [data-testid="stCodeCopyButton"],
+[data-testid="stCodeBlock"] [data-testid="stCodeCopyButton"],
+[data-testid="stCode"] button,
+[data-testid="stCodeBlock"] button,
+[data-testid="stCode"] [class*="copy"],
+[data-testid="stCodeBlock"] [class*="copy"],
+[data-testid="stCode"] [class*="Copy"],
+[data-testid="stCodeBlock"] [class*="Copy"] {
+  background: transparent !important;
+  background-color: transparent !important;
+  color: var(--ink-muted) !important;
+  border: 1px solid var(--rule) !important;
+  box-shadow: none !important;
+}
+[data-testid="stCode"] button:hover,
+[data-testid="stCodeBlock"] button:hover,
+[data-testid="stCode"] [class*="copy"]:hover,
+[data-testid="stCodeBlock"] [class*="copy"]:hover,
+[data-testid="stCode"] [class*="Copy"]:hover,
+[data-testid="stCodeBlock"] [class*="Copy"]:hover {
+  background: var(--surface-2) !important;
+  background-color: var(--surface-2) !important;
+  color: var(--ink) !important;
+}
+[data-testid="stCode"] button svg,
+[data-testid="stCodeBlock"] button svg,
+[data-testid="stCode"] [class*="copy"] svg,
+[data-testid="stCodeBlock"] [class*="copy"] svg {
+  fill: currentColor !important;
+  stroke: currentColor !important;
 }
 
 /* alerts (st.error / st.warning) */
@@ -549,6 +680,81 @@ _FORCE_LIGHT_CSS = f"<style>:root {{ {_LIGHT_TOKENS} }}</style>"
 _FORCE_DARK_CSS = f"<style>:root {{ {_DARK_TOKENS} }}</style>"
 
 
+# Report palette overrides — must mirror the variable names defined in
+# `reflection_coefficient.rw_report._CSS` (shared with irregular_report).
+# When the user forces a theme in the app chrome, we inject one of these
+# into the generated report HTML before embedding it in an iframe, so the
+# preview tracks the app theme instead of the iframe's own
+# prefers-color-scheme.
+_REPORT_LIGHT = """
+:root {
+  --color-background-primary:#ffffff;--color-background-secondary:#f5f5f2;
+  --color-background-success:#EAF3DE;--color-background-warning:#FAEEDA;
+  --color-background-danger:#FCEBEB;--color-text-primary:#1a1a1a;
+  --color-text-secondary:#5f5e5a;--color-border-tertiary:rgba(0,0,0,0.15);
+  --color-border-secondary:rgba(0,0,0,0.3);
+}
+"""
+
+_REPORT_DARK = """
+:root {
+  --color-background-primary:#1a1a1a;--color-background-secondary:#2c2c2a;
+  --color-background-success:#173404;--color-background-warning:#412402;
+  --color-background-danger:#501313;--color-text-primary:#e8e8e8;
+  --color-text-secondary:#b4b2a9;--color-border-tertiary:rgba(255,255,255,0.15);
+  --color-border-secondary:rgba(255,255,255,0.3);
+}
+/* Suppress the report's own prefers-color-scheme rule when we force light.
+   This override sits in a second @media block so the user's chosen dark
+   palette survives even in OS light mode (and vice versa). */
+@media (prefers-color-scheme: light) {
+  :root {
+    --color-background-primary:#1a1a1a;--color-background-secondary:#2c2c2a;
+    --color-background-success:#173404;--color-background-warning:#412402;
+    --color-background-danger:#501313;--color-text-primary:#e8e8e8;
+    --color-text-secondary:#b4b2a9;--color-border-tertiary:rgba(255,255,255,0.15);
+    --color-border-secondary:rgba(255,255,255,0.3);
+  }
+}
+"""
+
+_REPORT_LIGHT_FORCE = """
+@media (prefers-color-scheme: dark) {
+  :root {
+    --color-background-primary:#ffffff;--color-background-secondary:#f5f5f2;
+    --color-background-success:#EAF3DE;--color-background-warning:#FAEEDA;
+    --color-background-danger:#FCEBEB;--color-text-primary:#1a1a1a;
+    --color-text-secondary:#5f5e5a;--color-border-tertiary:rgba(0,0,0,0.15);
+    --color-border-secondary:rgba(0,0,0,0.3);
+  }
+}
+"""
+
+
+def _themed_report_html(html_str: str, mode: str) -> str:
+    """Inject a theme override into a generated report before iframe embed.
+
+    ``mode`` is the user's chrome-theme choice ("system" | "light" | "dark").
+    "system" leaves the HTML untouched — the iframe already follows the OS
+    preference via the report's own media query. For "light" / "dark" we
+    splice a <style> block just before </head> that pins both the default
+    ``:root`` and the relevant media-query branch onto the chosen palette,
+    so the report does not revert when the OS preference disagrees.
+    """
+    if mode == "light":
+        override = f"<style>{_REPORT_LIGHT}{_REPORT_LIGHT_FORCE}</style>"
+    elif mode == "dark":
+        override = f"<style>{_REPORT_DARK}</style>"
+    else:
+        return html_str
+    # Place right before </head> so source order beats the original :root.
+    # Fallback to prepending if the document lacks a head (shouldn't happen
+    # with the current reports, but be defensive).
+    if "</head>" in html_str:
+        return html_str.replace("</head>", f"{override}</head>", 1)
+    return override + html_str
+
+
 # --- plumbing (unchanged from prior revision) --------------------------------
 
 def _pick(kind: str) -> str | None:
@@ -592,9 +798,11 @@ def _scratch_dir():
         shutil.rmtree(path, ignore_errors=True)
 
 
-def _write_kr_vs_freq(results, out_dir: Path, method: str) -> Path:
+def _write_kr_vs_freq(results, out_dir: Path, method: str,
+                      window_mode: str = "canonical") -> Path:
     rows = sorted(results, key=lambda r: r.f_Hz)
-    csv_path = out_dir / f"rw_kr_vs_freq_{method}.csv"
+    suffix = "" if window_mode == "canonical" else f"_{window_mode}"
+    csv_path = out_dir / f"rw_kr_vs_freq_{method}{suffix}.csv"
     with csv_path.open("w", newline="") as fh:
         w = csv.writer(fh)
         w.writerow(["test_id", "f_Hz", "k_rad_m", "L_m",
@@ -786,15 +994,31 @@ def _headline_skeleton() -> str:
 
 
 def _summary_strip(scheme: str, method: str, window: str, bandwidth: float,
-                   head: float, tail: float, n_tests: int) -> str:
+                   head: float, tail: float, n_tests: int,
+                   window_mode: str = "canonical",
+                   freq_source: str = "bin",
+                   goda_pair: str = "13") -> str:
     bw = f"{bandwidth:g} Hz" if window != "none" else "—"
     tests = f"{n_tests} test" + ("s" if n_tests != 1 else "")
+    mode_chip = (
+        f' · mode <code>{_html.escape(window_mode)}</code>'
+        if window_mode != "canonical" else ""
+    )
+    freq_chip = (
+        f' · freq <code>{_html.escape(freq_source)}</code>'
+        if scheme == "rw" and freq_source != "bin" else ""
+    )
+    pair_chip = (
+        f' · pair <code>{_html.escape(goda_pair)}</code>'
+        if method == "goda" else ""
+    )
     return (
         f'<div class="rc-summary-strip">'
         f'<span><code>{_html.escape(_SCHEME_LABELS[scheme])}</code> · '
-        f'<code>{tests}</code> · <code>{method}</code> · '
+        f'<code>{tests}</code> · <code>{method}</code>{pair_chip} · '
         f'window <code>{window}</code> ({bw}) · '
-        f'head <code>{head:g}s</code> tail <code>{tail:g}s</code></span>'
+        f'head <code>{head:g}s</code> tail <code>{tail:g}s</code>'
+        f'{mode_chip}{freq_chip}</span>'
         f'<span>edit below</span>'
         f'</div>'
     )
@@ -905,6 +1129,44 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+c6, c7, c8 = st.columns(3)
+window_mode = c6.selectbox(
+    "Window mode", ["canonical", "noref"],
+    help=(
+        "canonical: standard post-reflection clip. "
+        "noref: pre-reflection window (incident at every probe, first "
+        "reflection has not yet returned to wp3) — a baseline sanity "
+        "check that should give Kr ≈ 0."
+    ),
+)
+freq_source = c7.selectbox(
+    "Frequency source", ["bin", "target"],
+    help=(
+        "Regular-wave only. bin: use the nearest FFT bin to meta.f_Hz. "
+        "target: single-point DFT evaluated at exactly meta.f_Hz, "
+        "bypassing bin quantisation (reduces leakage on short clips)."
+    ),
+    disabled=(scheme != "rw"),
+)
+goda_pair = c8.selectbox(
+    "Goda pair", ["13", "12", "23"],
+    help=(
+        "Goda only. Which probe pair feeds the two-probe separation: "
+        "'13' (wp1 & wp3, widest spacing, default), '12' (wp1 & wp2), "
+        "'23' (wp2 & wp3, spacing = X13 − X12). Changing Δ moves the "
+        "kΔ = nπ singularities — useful when the default pair sits on "
+        "a near-singular frequency."
+    ),
+    disabled=(method != "goda"),
+)
+st.markdown(
+    '<p class="rc-caption">Window mode switches between the reflection '
+    'clip and the pre-reflection incident-only window. Frequency source '
+    'applies to regular waves only; Goda pair applies only when the '
+    'method is Goda.</p>',
+    unsafe_allow_html=True,
+)
+
 run_col, _ = st.columns([1, 3])
 with run_col:
     run_clicked = st.button(
@@ -932,9 +1194,12 @@ if run_clicked:
         t0 = time.perf_counter()
         log(f"[streamlit_app] log file: {log_path}")
         bw_txt = f"{bandwidth:g} Hz" if window != "none" else "—"
+        pair_txt = f" | goda_pair={goda_pair}" if method == "goda" else ""
         banner = (
-            f" {_SCHEME_LABELS[scheme]} | method={method} | window={window} "
-            f"(bw {bw_txt}) | drops head {head_drop:g}s tail {tail_drop:g}s "
+            f" {_SCHEME_LABELS[scheme]} | method={method}{pair_txt} "
+            f"| window={window} (bw {bw_txt}) "
+            f"| drops head {head_drop:g}s tail {tail_drop:g}s "
+            f"| mode={window_mode} | freq={freq_source} "
         )
         log("=" * len(banner))
         log(banner)
@@ -965,6 +1230,9 @@ if run_clicked:
                         t, e1, e2, e3, meta, method=method,
                         window=window, bandwidth_Hz=bandwidth,
                         head_drop_s=head_drop, tail_drop_s=tail_drop,
+                        window_mode=window_mode,
+                        freq_source=freq_source,
+                        goda_pair=goda_pair,
                     )
                 except Exception as exc:
                     st.error(f"Couldn't analyse {tid}: {exc}")
@@ -992,9 +1260,15 @@ if run_clicked:
                     irregular_meta = meta
                     hp = write_irregular_report(
                         result, meta, tmp_path, method, timestamp="preview",
+                        window_mode=window_mode,
                     )
                     html_bytes = hp.read_bytes()
-                    cp = tmp_path / f"{result.test_id}_{method}_spectrum.csv"
+                    mode_suffix = (
+                        "" if window_mode == "canonical" else f"_{window_mode}"
+                    )
+                    cp = tmp_path / (
+                        f"{result.test_id}_{method}{mode_suffix}_spectrum.csv"
+                    )
                     csv_bundle = (cp.name, cp.read_bytes())
                     report_name = hp.name
                     d = result.diagnostics
@@ -1011,10 +1285,14 @@ if run_clicked:
                         f"(pending user download)")
 
             if scheme == "rw" and len(regular_results) >= 2:
-                csv_path = _write_kr_vs_freq(regular_results, tmp_path, method)
+                csv_path = _write_kr_vs_freq(
+                    regular_results, tmp_path, method,
+                    window_mode=window_mode,
+                )
                 hp = write_rw_report(
                     list(zip(regular_results, regular_metas)),
                     tmp_path, method, csv_path=csv_path, timestamp="preview",
+                    window_mode=window_mode,
                 )
                 html_bytes = hp.read_bytes()
                 csv_bundle = (csv_path.name, csv_path.read_bytes())
@@ -1038,6 +1316,8 @@ if run_clicked:
         "scheme": scheme, "method": method, "window": window,
         "bandwidth": bandwidth, "head": head_drop, "tail": tail_drop,
         "n_tests": len(selected),
+        "window_mode": window_mode, "freq_source": freq_source,
+        "goda_pair": goda_pair,
     }
 
 # --- result ------------------------------------------------------------------
@@ -1073,7 +1353,14 @@ if html_bytes is not None:
         f'</div>',
         unsafe_allow_html=True,
     )
-    components.html(html_bytes.decode("utf-8"), height=820, scrolling=True)
+    components.html(
+        _themed_report_html(
+            html_bytes.decode("utf-8"),
+            st.session_state.get("theme_mode", "system"),
+        ),
+        height=820,
+        scrolling=True,
+    )
 
     d1, d2, _ = st.columns([1, 1, 3])
     d1.download_button(

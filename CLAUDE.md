@@ -212,7 +212,14 @@ Persisted per-user choices (stored in `~/.reflection_coefficient.json` alongside
 the three paths): `--method` (goda / least_squares, default least_squares),
 `--window` (none / hann, default hann), `--bandwidth` (Hz, default 0.04),
 `--head-drop` and `--tail-drop` (seconds trimmed from the start/end of the
-travel-time clip to skip ramp transients, default 3.0 s each).
+travel-time clip to skip ramp transients, default 3.0 s each), and
+`--freq-source` (regular-wave only, bin / target, default bin; `target`
+evaluates a single-point DFT at exactly `meta.f_Hz` instead of snapping to
+the nearest FFT bin).
+
+`--window-mode` (canonical / noref) is **not** persisted — it is intended
+as an explicit diagnostic mode (pre-reflection baseline check where Kr
+should be ≈ 0). Output filenames gain a `_noref` suffix when used.
 
 `--test all` is only supported for `--scheme rw`. For irregular schemes
 (`wn` / `js`) you must pass an explicit test id. `--scheme` is prompted

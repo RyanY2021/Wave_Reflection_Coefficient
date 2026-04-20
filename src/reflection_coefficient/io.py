@@ -99,6 +99,32 @@ def resolve_method(explicit: str | None, default: str = "least_squares") -> str:
     return _load_user_config().get("method", default)
 
 
+def save_freq_source(freq_source: str) -> None:
+    """Persist the regular-wave frequency-source choice (bin / target)."""
+    cfg = _load_user_config()
+    cfg["freq_source"] = freq_source
+    _save_user_config(cfg)
+
+
+def resolve_freq_source(explicit: str | None, default: str = "bin") -> str:
+    if explicit is not None:
+        return explicit
+    return _load_user_config().get("freq_source", default)
+
+
+def save_goda_pair(goda_pair: str) -> None:
+    """Persist the Goda probe-pair choice (13 / 12 / 23)."""
+    cfg = _load_user_config()
+    cfg["goda_pair"] = goda_pair
+    _save_user_config(cfg)
+
+
+def resolve_goda_pair(explicit: str | None, default: str = "13") -> str:
+    if explicit is not None:
+        return explicit
+    return _load_user_config().get("goda_pair", default)
+
+
 def save_window(window: str | None = None, bandwidth_Hz: float | None = None) -> None:
     """Persist the window-type and/or bandwidth choice."""
     cfg = _load_user_config()
