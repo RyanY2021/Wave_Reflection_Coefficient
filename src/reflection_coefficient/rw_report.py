@@ -412,12 +412,15 @@ def write_rw_report(
     method: str,
     csv_path: Path | None = None,
     timestamp: str | None = None,
+    window_mode: str = "canonical",
 ) -> Path:
-    """Write ``rw_report_<method>.html`` into ``out_dir`` and return its path.
+    """Write ``rw_report_<method>[_<mode>].html`` into ``out_dir`` and return its path.
 
     ``pairs`` is a list of ``(RegularResult, TestMeta)`` — each meta supplies
     the per-test ``t_gen_s`` plus the (shared) tank geometry. The first meta
-    is used for the tank-layout SVG and geometry cards.
+    is used for the tank-layout SVG and geometry cards. ``window_mode`` is
+    threaded in only to tag the title and output filename; the time-window
+    quantities already live on each ``RegularResult``.
     """
     if not pairs:
         raise ValueError("write_rw_report: no results to report")
@@ -425,8 +428,10 @@ def write_rw_report(
     rows = [_row_for(r, m) for r, m in pairs]
     rows.sort(key=lambda r: r["f"])
 
+    mode_tag = "" if window_mode == "canonical" else f" — {window_mode} window"
     header = (
-        f"<h1>Regular-wave reflection report — method: {html.escape(method)}</h1>"
+        f"<h1>Regular-wave reflection report — method: {html.escape(method)}"
+        f"{html.escape(mode_tag)}</h1>"
     )
     if timestamp:
         header += (
@@ -466,6 +471,7 @@ def write_rw_report(
         f'<script>{_CHART_DEFAULTS}</script>'
         f'{body}</body></html>'
     )
-    out_path = out_dir / f"rw_report_{method}.html"
+    suffix = "" if window_mode == "canonical" else f"_{window_mode}"
+    out_path = out_dir / f"rw_report_{method}{suffix}.html"
     out_path.write_text(html_doc, encoding="utf-8")
     return out_path

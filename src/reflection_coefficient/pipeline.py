@@ -32,11 +32,42 @@ from .methods.least_squares import mansard_funke_separation
 from .preprocessing import clip_window, hanning_window, remove_mean
 
 MethodName = Literal["goda", "least_squares"]
+WindowMode = Literal["canonical", "noref"]
+FreqSource = Literal["bin", "target"]
+GodaPair = Literal["13", "12", "23"]
+
+
+def _goda_pair_spacing(pair: GodaPair, X12: float, X13: float) -> float:
+    """Physical spacing Δ between the two probes used by the Goda separation."""
+    if pair == "13":
+        return float(X13)
+    if pair == "12":
+        return float(X12)
+    if pair == "23":
+        return float(X13 - X12)
+    raise ValueError(f"Unknown goda_pair {pair!r}; expected '13', '12', or '23'")
 
 
 # ---------------------------------------------------------------------------
 # Geometry / clipping window
 # ---------------------------------------------------------------------------
+
+
+def _noref_bounds(
+    cg: float, x_paddle: float, x_struct: float, X13: float,
+) -> tuple[float, float]:
+    """Pre-reflection window: incident established at all probes, first
+    reflection from the structure has not yet come back to wp3.
+
+    ``t_start`` is when the incident wave has reached the last probe (wp3).
+    ``t_end`` is when the first reflection returns to wp3 (the first probe
+    on the return path). Passing ``cg_slowest`` to ``t_start`` and
+    ``cg_fastest`` to ``t_end`` gives a conservative no-reflection window
+    for a broadband record; for regular waves both are the same ``cg``.
+    """
+    t_start = (x_paddle + X13) / cg
+    t_end = (x_paddle + X13 + 2.0 * x_struct) / cg
+    return float(t_start), float(t_end)
 
 
 def _require_geometry(meta: TestMeta) -> tuple[float, float, float, float]:
@@ -98,6 +129,10 @@ class RegularResult:
     tail_drop_s: float = 0.0
     t_analysis_start_s: float = 0.0
     t_analysis_end_s: float = 0.0
+    window_mode: str = "canonical"
+    freq_source: str = "bin"
+    f_target_Hz: float = 0.0
+    goda_pair: str = "13"
 
 
 @dataclass
@@ -133,6 +168,9 @@ def analyse_regular(
     method: MethodName = "least_squares",
     head_drop_s: float = 0.0,
     tail_drop_s: float = 0.0,
+    window_mode: WindowMode = "canonical",
+    freq_source: FreqSource = "bin",
+    goda_pair: GodaPair = "13",
 ) -> RegularResult:
     if meta.f_Hz is None:
         raise ValueError(f"{meta.test_id}: regular-wave analysis requires meta.f_Hz")
@@ -141,7 +179,12 @@ def analyse_regular(
     g = meta.gravity_m_s2
 
     cg = group_velocity(meta.f_Hz, depth, g=g)
-    t_start, t_end_physics = clip_bounds(cg, x_paddle, x_struct, X13)
+    if window_mode == "canonical":
+        t_start, t_end_physics = clip_bounds(cg, x_paddle, x_struct, X13)
+    elif window_mode == "noref":
+        t_start, t_end_physics = _noref_bounds(cg, x_paddle, x_struct, X13)
+    else:
+        raise ValueError(f"Unknown window_mode {window_mode!r}")
 
     # Runtime cap: hard upper bound is the record tail; if t_gen_s is known,
     # extend it to t_gen_s + x_paddle/cg — the last incident crest generated
@@ -190,33 +233,62 @@ def analyse_regular(
 
     fs = 1.0 / np.mean(np.diff(t_c))
     N = e1.size
-    freqs, B1 = positive_fft(e1, fs)
-    _, B2 = positive_fft(e2, fs)
-    _, B3 = positive_fft(e3, fs)
-
-    df = fs / N
-    k_bin = int(round(meta.f_Hz / df))
-    if not (1 <= k_bin < freqs.size):
-        raise ValueError(
-            f"{meta.test_id}: target f={meta.f_Hz} Hz falls outside FFT range"
-        )
 
     k_val, L = solve_dispersion(meta.f_Hz, depth, g=g)
+    f_target = float(meta.f_Hz)
+
+    if freq_source == "bin":
+        freqs, B1 = positive_fft(e1, fs)
+        _, B2 = positive_fft(e2, fs)
+        _, B3 = positive_fft(e3, fs)
+        df = fs / N
+        k_bin = int(round(f_target / df))
+        if not (1 <= k_bin < freqs.size):
+            raise ValueError(
+                f"{meta.test_id}: target f={f_target} Hz falls outside FFT range"
+            )
+        b1, b2, b3 = B1[k_bin], B2[k_bin], B3[k_bin]
+        f_used = float(freqs[k_bin])
+    elif freq_source == "target":
+        # Single-point Goertzel-equivalent DFT evaluated at exactly f_target
+        # (not snapped to an FFT bin). Convention matches np.fft.fft:
+        #   B(f) = Σ x[n] · exp(-i·2π·f·n/fs)
+        # Clip-window samples are uniform (Δt from fs); start-time phase
+        # cancels across probes so we can treat the first sample as n=0.
+        if not (0.0 < f_target < 0.5 * fs):
+            raise ValueError(
+                f"{meta.test_id}: target f={f_target} Hz outside (0, fs/2)"
+            )
+        phasor = np.exp(-1j * 2.0 * np.pi * f_target * np.arange(N) / fs)
+        b1 = complex(np.sum(e1 * phasor))
+        b2 = complex(np.sum(e2 * phasor))
+        b3 = complex(np.sum(e3 * phasor))
+        f_used = f_target
+    else:
+        raise ValueError(f"Unknown freq_source {freq_source!r}")
 
     if method == "goda":
         k_arr = np.array([k_val])
+        # Pick which two probes to feed Goda. Convention: first argument is the
+        # probe nearest the paddle, second is nearer the structure; spacing is
+        # the physical distance between them.
+        if goda_pair == "13":
+            b_near, b_far = b1, b3
+        elif goda_pair == "12":
+            b_near, b_far = b1, b2
+        elif goda_pair == "23":
+            b_near, b_far = b2, b3
+        else:
+            raise ValueError(f"Unknown goda_pair {goda_pair!r}")
+        spacing = _goda_pair_spacing(goda_pair, X12, X13)
         Z_I, Z_R, valid = goda_separation(
-            np.array([B1[k_bin]]), np.array([B3[k_bin]]), k_arr, X13
+            np.array([b_near]), np.array([b_far]), k_arr, spacing
         )
     elif method == "least_squares":
         k_arr = np.array([k_val])
         Z_I, Z_R, valid = mansard_funke_separation(
-            np.array([B1[k_bin]]),
-            np.array([B2[k_bin]]),
-            np.array([B3[k_bin]]),
-            k_arr,
-            X12,
-            X13,
+            np.array([b1]), np.array([b2]), np.array([b3]),
+            k_arr, X12, X13,
         )
     else:
         raise ValueError(f"Unknown method {method!r}")
@@ -228,7 +300,7 @@ def analyse_regular(
     return RegularResult(
         test_id=meta.test_id,
         method=method,
-        f_Hz=float(freqs[k_bin]),
+        f_Hz=f_used,
         k=k_val,
         wavelength_m=L,
         a_I=a_I,
@@ -247,6 +319,10 @@ def analyse_regular(
         tail_drop_s=float(tail_drop_s),
         t_analysis_start_s=float(t_ana_start),
         t_analysis_end_s=float(t_ana_end),
+        window_mode=window_mode,
+        freq_source=freq_source,
+        f_target_Hz=f_target,
+        goda_pair=goda_pair,
     )
 
 
@@ -276,6 +352,8 @@ def analyse_irregular(
     bandwidth_Hz: float | None = None,
     head_drop_s: float = 0.0,
     tail_drop_s: float = 0.0,
+    window_mode: WindowMode = "canonical",
+    goda_pair: GodaPair = "13",
 ) -> IrregularResult:
     """Irregular-wave reflection analysis (white-noise or JONSWAP).
 
@@ -313,7 +391,6 @@ def analyse_irregular(
     cg_hi = group_velocity(f_hi, depth, g=g)
     cg_fastest = max(cg_lo, cg_hi)
     cg_slowest = min(cg_lo, cg_hi)
-    t_start, _ = clip_bounds(cg_slowest, x_paddle, x_struct, X13)
 
     # t_end: follow the Goda-Suzuki / Mansard-Funke convention for random-wave
     # records — take a long stationary segment and let the spectral/LSQ
@@ -330,7 +407,20 @@ def analyse_irregular(
         )
     else:
         runtime_bound = record_tail
-    t_end = runtime_bound
+
+    if window_mode == "canonical":
+        t_start, _ = clip_bounds(cg_slowest, x_paddle, x_struct, X13)
+        t_end = runtime_bound
+    elif window_mode == "noref":
+        # Slowest cg sets the latest "incident at all probes" moment;
+        # fastest cg sets the earliest "first reflection back at wp3" moment.
+        t_start, t_end_physics = (
+            (x_paddle + X13) / cg_slowest,
+            (x_paddle + X13 + 2.0 * x_struct) / cg_fastest,
+        )
+        t_end = min(t_end_physics, runtime_bound)
+    else:
+        raise ValueError(f"Unknown window_mode {window_mode!r}")
     runtime_capped = runtime_bound < record_tail
 
     if t_end <= t_start:
@@ -395,8 +485,17 @@ def analyse_irregular(
     k_arr = solve_dispersion_array(f_pos, depth, g=g)
 
     if method == "goda":
-        Z_I, Z_R, valid = goda_separation(B1, B3, k_arr, X13)
-        D_or_sin2 = np.sin(k_arr * X13) ** 2
+        if goda_pair == "13":
+            Bn, Bf = B1, B3
+        elif goda_pair == "12":
+            Bn, Bf = B1, B2
+        elif goda_pair == "23":
+            Bn, Bf = B2, B3
+        else:
+            raise ValueError(f"Unknown goda_pair {goda_pair!r}")
+        spacing = _goda_pair_spacing(goda_pair, X12, X13)
+        Z_I, Z_R, valid = goda_separation(Bn, Bf, k_arr, spacing)
+        D_or_sin2 = np.sin(k_arr * spacing) ** 2
     elif method == "least_squares":
         Z_I, Z_R, valid = mansard_funke_separation(B1, B2, B3, k_arr, X12, X13)
         sb = np.sin(k_arr * X12)
@@ -464,6 +563,8 @@ def analyse_irregular(
         "window": window,
         "n_bands": int(n_bands),
         "bandwidth_Hz": float(bandwidth_effective),
+        "window_mode": window_mode,
+        "goda_pair": goda_pair if method == "goda" else None,
     }
 
     return IrregularResult(
@@ -496,15 +597,27 @@ def analyse(
     bandwidth_Hz: float | None = None,
     head_drop_s: float = 0.0,
     tail_drop_s: float = 0.0,
+    window_mode: WindowMode = "canonical",
+    freq_source: FreqSource = "bin",
+    goda_pair: GodaPair = "13",
 ) -> RegularResult | IrregularResult:
-    """Dispatch to the regular or irregular path based on ``meta.campaign``."""
+    """Dispatch to the regular or irregular path based on ``meta.campaign``.
+
+    ``freq_source`` is a regular-wave-only switch; ignored for wn/js.
+    ``goda_pair`` only takes effect when ``method == "goda"``.
+    """
     if meta.campaign == "rw":
         return analyse_regular(
             t, eta1, eta2, eta3, meta, method=method,
             head_drop_s=head_drop_s, tail_drop_s=tail_drop_s,
+            window_mode=window_mode,
+            freq_source=freq_source,
+            goda_pair=goda_pair,
         )
     return analyse_irregular(
         t, eta1, eta2, eta3, meta, method=method,
         window=window, bandwidth_Hz=bandwidth_Hz,
         head_drop_s=head_drop_s, tail_drop_s=tail_drop_s,
+        window_mode=window_mode,
+        goda_pair=goda_pair,
     )
