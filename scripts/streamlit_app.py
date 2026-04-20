@@ -29,11 +29,15 @@ from tkinter import filedialog
 import streamlit as st
 import streamlit.components.v1 as components
 
+from reflection_coefficient.calibration import recalibrate_probes
 from reflection_coefficient.io import (
     list_tests,
     load_probe_data,
+    load_probes_config,
     resolve_data_dir,
     resolve_metadata_dir,
+    resolve_probes_config,
+    resolve_recalibrate,
     resolve_tank_config,
 )
 from reflection_coefficient.irregular_report import write_irregular_report
@@ -45,9 +49,9 @@ _LOG_DIR = _PROJECT_ROOT / "log"
 _LOG_KEEP = 10
 
 _SCHEME_LABELS = {
-    "rw": "Regular wave",
-    "wn": "White-noise irregular",
-    "js": "JONSWAP irregular",
+    "rw": "Regular Wave",
+    "wn": "White Noise",
+    "js": "JONSWAP",
 }
 
 
@@ -95,8 +99,8 @@ _DARK_TOKENS = """
 
 _CSS = """
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Spectral:ital,wght@0,300;0,400;0,500;0,600;0,700;1,400;1,500&display=swap');
-@import url('https://fonts.googleapis.com/css2?family=Commit+Mono:wght@400;500;700&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Spectral:wght@400;500&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Commit+Mono:wght@400&display=swap');
 
 :root {
   --space-1: 4px;  --space-2: 8px;  --space-3: 12px; --space-4: 16px;
@@ -126,7 +130,7 @@ html, body, [data-testid="stAppViewContainer"] {
   background: var(--bg) !important;
   color: var(--ink);
   font-family: var(--font-serif);
-  font-feature-settings: 'liga', 'kern', 'onum';
+  font-feature-settings: 'liga', 'kern', 'lnum', 'pnum';
 }
 [data-testid="stHeader"] { background: transparent; }
 [data-testid="stToolbar"] { right: var(--space-4); }
@@ -159,17 +163,16 @@ p, li, label, span, div { color: var(--ink); }
   border-bottom: 1px solid var(--rule);
 }
 .rc-masthead__title {
-  font-family: var(--font-serif);
+  /* Galaxie Copernicus (Village Type, commercial) is the preferred face
+     when it's locally installed; Spectral + Georgia absorb the fall-through
+     on machines that don't have it. */
+  font-family: 'Galaxie Copernicus', 'Copernicus', 'Spectral',
+               Georgia, 'Times New Roman', serif;
   font-weight: 500;
   font-size: var(--text-lg);
   line-height: var(--lh-lg);
   letter-spacing: -0.015em;
   margin: 0;
-}
-.rc-masthead__title em {
-  font-style: italic;
-  color: var(--ink-muted);
-  font-weight: 400;
 }
 .rc-masthead__meta {
   font-family: var(--font-mono);
@@ -183,7 +186,7 @@ p, li, label, span, div { color: var(--ink); }
 .rc-section-label {
   font-family: var(--font-mono);
   font-size: var(--text-2xs);
-  letter-spacing: 0.14em;
+  letter-spacing: 0.1em;
   text-transform: uppercase;
   color: var(--ink-faint);
   padding-bottom: var(--space-2);
@@ -288,6 +291,22 @@ p, li, label, span, div { color: var(--ink); }
   font-family: var(--font-mono) !important;
   font-size: var(--text-2xs) !important;
 }
+/* select-widget chrome icons (the dropdown chevron, the multiselect
+   "clear all" cross, and the per-tag × glyph) ship with a near-white
+   fill that disappears on the cream surface in light mode. Pin them to
+   --rule-strong so they read as the same structural grey as the panel
+   and input borders — present enough to act on, quiet enough not to
+   compete with the actual content. Lift to --ink on hover. */
+[data-baseweb="select"] svg {
+  fill: var(--rule-strong) !important;
+  color: var(--rule-strong) !important;
+}
+[data-baseweb="select"] [role="button"]:hover svg,
+[data-baseweb="select"] [role="presentation"]:hover svg,
+[data-baseweb="tag"]:hover svg {
+  fill: var(--ink) !important;
+  color: var(--ink) !important;
+}
 
 /* dropdown popover (the panel that opens when a selectbox is clicked) —
    BaseWeb renders it in a portal outside the widget tree, so it has to be
@@ -357,13 +376,73 @@ div[data-baseweb="popover"] > div > div {
   margin-bottom: var(--space-1) !important;
 }
 
+/* help / tooltip icon next to widget labels — Streamlit ships this with no
+   color rule, so on the cream surface in light mode it disappears. Pin it
+   to --ink-muted (one tier stronger than the small-caps label) so the
+   thin-stroke glyph reads clearly against the cream, and lift to --ink on
+   hover. The inner <path> needs the fill override explicitly because the
+   SVG carries a hard-coded fill attribute that would otherwise win over
+   any CSS applied to the outer <svg>. */
+[data-testid="stTooltipIcon"],
+[data-testid="stTooltipHoverTarget"],
+[data-testid="stWidgetLabel"] svg {
+  color: var(--ink-muted) !important;
+  opacity: 1 !important;
+}
+[data-testid="stTooltipIcon"] svg,
+[data-testid="stTooltipHoverTarget"] svg,
+[data-testid="stWidgetLabel"] svg {
+  fill: currentColor !important;
+}
+[data-testid="stTooltipIcon"]:hover,
+[data-testid="stTooltipHoverTarget"]:hover,
+[data-testid="stWidgetLabel"]:hover svg {
+  color: var(--ink) !important;
+}
+
+/* tooltip popover (the floating panel that appears when hovering a help
+   icon) — BaseWeb's dark charcoal bubble is the right shape; only its
+   text color needs fixing so helper copy stays legible in light mode
+   where Streamlit's default renders dark-on-dark. Leave background,
+   border, and shadow to BaseWeb so the bubble keeps its native form. */
+[data-baseweb="tooltip"],
+[data-testid="stTooltipContent"],
+[role="tooltip"],
+[data-baseweb="tooltip"] *,
+[data-testid="stTooltipContent"] *,
+[role="tooltip"] * {
+  color: oklch(0.96 0.006 80) !important;
+}
+
 /* setup panel wrapper */
 .rc-setup {
   background: var(--surface);
   border: 1px solid var(--rule);
   border-radius: 3px;
-  padding: var(--space-5) var(--space-5) var(--space-4);
+  padding: var(--space-5) var(--space-5) var(--space-5);
   margin-bottom: var(--space-5);
+}
+/* reclaim the ~48px of doubled whitespace at the top of the panel — the
+   first section label shouldn't add its margin on top of the panel's own
+   padding. */
+.rc-setup .rc-section-label:first-of-type {
+  margin-top: 0;
+}
+
+/* optional calibration subgroup — the probes-config picker + recalibrate
+   toggle belong together (the path only matters when the toggle is on), so
+   a hairline top rule sets them apart from the required paths above without
+   a new heading. */
+.rc-setup__subgroup {
+  margin-top: var(--space-3);
+  padding-top: var(--space-3);
+  border-top: 1px dashed var(--rule);
+}
+
+/* lift the primary action away from the last tuning caption. A larger gap
+   here reads as "a beat before you commit" rather than "another row." */
+.rc-run-row {
+  margin-top: var(--space-5);
 }
 
 /* summary strip after a run */
@@ -403,7 +482,7 @@ div[data-baseweb="popover"] > div > div {
 .rc-headline__label {
   font-family: var(--font-mono);
   font-size: var(--text-2xs);
-  letter-spacing: 0.14em;
+  letter-spacing: 0.1em;
   text-transform: uppercase;
   color: var(--ink-faint);
   margin: 0 0 var(--space-2);
@@ -505,14 +584,15 @@ div[data-baseweb="popover"] > div > div {
 .rc-preview-title {
   font-family: var(--font-serif);
   font-weight: 500;
-  font-size: var(--text-md);
-  letter-spacing: -0.01em;
+  font-size: var(--text-lg);
+  line-height: var(--lh-lg);
+  letter-spacing: -0.012em;
   margin: 0;
 }
 .rc-preview-kicker {
   font-family: var(--font-mono);
   font-size: var(--text-2xs);
-  letter-spacing: 0.14em;
+  letter-spacing: 0.1em;
   text-transform: uppercase;
   color: var(--ink-faint);
 }
@@ -540,7 +620,7 @@ div[data-baseweb="popover"] > div > div {
 [data-testid="stExpander"] [data-testid="stExpanderHeader"] {
   background: transparent !important;
   background-color: transparent !important;
-  color: var(--ink-faint) !important;
+  color: var(--ink-muted) !important;
   font-family: var(--font-mono) !important;
   font-size: var(--text-2xs) !important;
   letter-spacing: 0.08em !important;
@@ -562,7 +642,6 @@ div[data-baseweb="popover"] > div > div {
 [data-testid="stExpander"] summary svg,
 [data-testid="stExpander"] button svg {
   fill: currentColor !important;
-  stroke: currentColor !important;
 }
 [data-testid="stExpander"] [data-testid="stExpanderDetails"] {
   background: transparent !important;
@@ -945,9 +1024,11 @@ def _headline_irregular(result: IrregularResult, meta) -> str:
         0.1 if result.method == "least_squares" else 0.05
     )
     pill = _pill("Clean", "ok") if ok else _pill("Near singularity", "warn")
+    # Hyphen (not en-dash) joins the compound adjective "least-squares".
+    # En-dashes are reserved for author-pair attributions like "Mansard–Funke".
     detail = (
         f'<p class="rc-headline__detail">Energy-based K<sub>r,overall</sub> '
-        f'from {result.method.replace("_", "–")} separation. '
+        f'from {result.method.replace("_", "-")} separation. '
         f'H<sub>m0,I</sub> = {result.Hm0_I:.4f} m, '
         f'H<sub>m0,R</sub> = {result.Hm0_R:.4f} m, '
         f'T<sub>p</sub> = {result.Tp_I:.3f} s.</p>'
@@ -997,7 +1078,8 @@ def _summary_strip(scheme: str, method: str, window: str, bandwidth: float,
                    head: float, tail: float, n_tests: int,
                    window_mode: str = "canonical",
                    freq_source: str = "bin",
-                   goda_pair: str = "13") -> str:
+                   goda_pair: str = "13",
+                   recalibrate: bool = False) -> str:
     bw = f"{bandwidth:g} Hz" if window != "none" else "—"
     tests = f"{n_tests} test" + ("s" if n_tests != 1 else "")
     mode_chip = (
@@ -1012,13 +1094,14 @@ def _summary_strip(scheme: str, method: str, window: str, bandwidth: float,
         f' · pair <code>{_html.escape(goda_pair)}</code>'
         if method == "goda" else ""
     )
+    recal_chip = ' · <code>recalibrated</code>' if recalibrate else ""
     return (
         f'<div class="rc-summary-strip">'
         f'<span><code>{_html.escape(_SCHEME_LABELS[scheme])}</code> · '
         f'<code>{tests}</code> · <code>{method}</code>{pair_chip} · '
         f'window <code>{window}</code> ({bw}) · '
         f'head <code>{head:g}s</code> tail <code>{tail:g}s</code>'
-        f'{mode_chip}{freq_chip}</span>'
+        f'{mode_chip}{freq_chip}{recal_chip}</span>'
         f'<span>edit below</span>'
         f'</div>'
     )
@@ -1027,7 +1110,7 @@ def _summary_strip(scheme: str, method: str, window: str, bandwidth: float,
 # --- page --------------------------------------------------------------------
 
 st.set_page_config(
-    page_title="Reflection coefficient",
+    page_title="Wave Reflection Calculator",
     page_icon="◦",
     layout="centered",
 )
@@ -1046,8 +1129,7 @@ elif _mode == "dark":
 m_left, m_right = st.columns([5, 2])
 m_left.markdown(
     '<h1 class="rc-masthead__title" style="margin:0;padding-top:6px;">'
-    'Reflection coefficient '
-    '<em>— a wave-tank companion</em></h1>',
+    'Wave Reflection Calculator</h1>',
     unsafe_allow_html=True,
 )
 with m_right:
@@ -1076,12 +1158,35 @@ meta_dir = _path_picker("Metadata", "meta_dir", "dir",
 data_dir = _path_picker("Data", "data_dir", "dir",
                         resolve_data_dir(None))
 
+st.markdown('<div class="rc-setup__subgroup">', unsafe_allow_html=True)
+probes_cfg = _path_picker("Probes config", "probes_cfg", "file",
+                          resolve_probes_config(None))
+recalibrate = st.radio(
+    "Re-calibrate",
+    ["off", "on"],
+    index=1 if resolve_recalibrate(None) else 0,
+    horizontal=True,
+    help=(
+        "Apply per-probe linear re-calibration from the probes config after "
+        "loading the raw time-series. When off, the probes config path is "
+        "ignored."
+    ),
+) == "on"
+st.markdown(
+    '<p class="rc-caption">Re-calibration multiplies each probe channel by '
+    'the gain / offset in the probes config before any analysis. Leave off '
+    'to use the raw acquisition signal as shipped.</p>',
+    unsafe_allow_html=True,
+)
+st.markdown('</div>', unsafe_allow_html=True)
+
 st.markdown(
     '<div class="rc-section-label">Scheme &amp; tests</div>',
     unsafe_allow_html=True,
 )
 scheme = st.radio("Scheme", ["rw", "wn", "js"], horizontal=True,
-                  label_visibility="collapsed")
+                  label_visibility="collapsed",
+                  format_func=lambda s: _SCHEME_LABELS[s])
 try:
     tests = list_tests(scheme, data_dir=data_dir, metadata_dir=meta_dir)
 except Exception as exc:
@@ -1167,6 +1272,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+st.markdown('<div class="rc-run-row">', unsafe_allow_html=True)
 run_col, _ = st.columns([1, 3])
 with run_col:
     run_clicked = st.button(
@@ -1175,6 +1281,7 @@ with run_col:
         disabled=not selected,
         use_container_width=True,
     )
+st.markdown('</div>', unsafe_allow_html=True)  # close .rc-run-row
 
 st.markdown('</div>', unsafe_allow_html=True)  # close .rc-setup
 
@@ -1185,6 +1292,21 @@ if run_clicked:
               "result_irregular", "result_meta", "log_path",
               "summary_args"):
         st.session_state.pop(k, None)
+
+    probes_cfg_data = None
+    if recalibrate:
+        if not probes_cfg.exists():
+            st.error(
+                f"Re-calibration is on but the probes config does not exist: "
+                f"{probes_cfg}. Point to an existing probes.json or switch "
+                f"re-calibration off."
+            )
+            st.stop()
+        try:
+            probes_cfg_data = load_probes_config(probes_cfg)
+        except Exception as exc:
+            st.error(f"Could not read probes config at {probes_cfg}: {exc}")
+            st.stop()
 
     # show a skeleton headline while the spinner runs
     skel_slot = st.empty()
@@ -1199,14 +1321,17 @@ if run_clicked:
             f" {_SCHEME_LABELS[scheme]} | method={method}{pair_txt} "
             f"| window={window} (bw {bw_txt}) "
             f"| drops head {head_drop:g}s tail {tail_drop:g}s "
+            f"| recalibrate={'on' if recalibrate else 'off'} "
             f"| mode={window_mode} | freq={freq_source} "
         )
         log("=" * len(banner))
         log(banner)
         log("=" * len(banner))
-        log(f"[streamlit_app] tank_config  = {tank_cfg}")
-        log(f"[streamlit_app] metadata_dir = {meta_dir}")
-        log(f"[streamlit_app] data_dir     = {data_dir}")
+        log(f"[streamlit_app] tank_config   = {tank_cfg}")
+        log(f"[streamlit_app] metadata_dir  = {meta_dir}")
+        log(f"[streamlit_app] data_dir      = {data_dir}")
+        log(f"[streamlit_app] probes_config = {probes_cfg}"
+            f"{'' if recalibrate else '  (unused — recalibrate off)'}")
         log(f"[streamlit_app] selected {len(selected)} test(s): "
             f"{', '.join(selected)}")
 
@@ -1223,8 +1348,12 @@ if run_clicked:
                     tank_config=tank_cfg, metadata_dir=meta_dir,
                     data_dir=data_dir,
                 )
+                if probes_cfg_data is not None:
+                    e1, e2, e3 = recalibrate_probes(e1, e2, e3, probes_cfg_data)
                 log(f"[streamlit_app] {tid}: N={len(t)}, "
-                    f"fs≈{1/(t[1]-t[0]):.1f} Hz")
+                    f"fs≈{1/(t[1]-t[0]):.1f} Hz"
+                    + ("  [recalibrated]" if probes_cfg_data is not None
+                       else ""))
                 try:
                     result = analyse(
                         t, e1, e2, e3, meta, method=method,
@@ -1317,7 +1446,7 @@ if run_clicked:
         "bandwidth": bandwidth, "head": head_drop, "tail": tail_drop,
         "n_tests": len(selected),
         "window_mode": window_mode, "freq_source": freq_source,
-        "goda_pair": goda_pair,
+        "goda_pair": goda_pair, "recalibrate": recalibrate,
     }
 
 # --- result ------------------------------------------------------------------
