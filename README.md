@@ -27,6 +27,7 @@ Reflection_Coefficient/
 │   ├── irregular_report.py    # HTML report — single irregular test
 │   └── utils.py
 ├── scripts/run_analysis.py    # CLI entry point
+├── scripts/streamlit_app.py   # Streamlit companion webpage
 ├── tests/                     # pytest suite
 ├── experiment_data/           # tank_config.json, probes.json, metadata/*.csv, raw RW###.txt / WN###.txt
 └── results/                   # generated output (gitignored)
@@ -96,9 +97,12 @@ Path inputs and analysis choices are **persisted per-user** in
 | `--head-drop SEC` | default: `3.0` | ✔ | Seconds to trim from the **start** of the clean analysis window, so the FFT skips ramp-up transients. |
 | `--tail-drop SEC` | default: `3.0` | ✔ | Seconds to trim from the **end** of the clean analysis window, so the FFT skips ramp-down transients. |
 | `--recalibrate` / `--no-recalibrate` | default: off | ✔ | Apply the per-probe linear re-calibration from `probes.json` after loading. See [Linear probe re-calibration](#linear-probe-re-calibration). |
+| `--window-mode {canonical,noref}` | default: `canonical` | — | Clip-window selection. `canonical` uses the full reflection-inclusive travel-time window from `docs/reflection_processing_pipeline.md` §2.1; `noref` uses a pre-reflection window ending before the first reflected front returns to probe 1, for a baseline sanity check where the true `Kr` should be zero. Explicit diagnostic — not persisted. Outputs gain a `_noref` filename suffix. |
+| `--freq-source {bin,target}` | default: `bin` | ✔ | Regular-wave only. `bin` uses the nearest FFT bin to `meta.f_Hz` (fastest, bin-quantised); `target` evaluates the DFT at exactly the target frequency from metadata via a single-point `Σ x[n]·exp(-i·2π·f·n/fs)`, eliminating bin-quantisation error. Ignored for `wn` / `js`. |
+| `--goda-pair {13,12,23}` | default: `13` | ✔ | Goda-only. Which two probes feed the two-probe separation: `13` = wp1 + wp3 (widest spacing, default), `12` = wp1 + wp2, `23` = wp2 + wp3 (spacing `X13 − X12`). Changing Δ moves the `kΔ = nπ` singularities in frequency — useful when the default pair sits on a near-singular bin for a given test. Ignored when `--method least_squares`. |
 | `--output PATH` | default: `<project>/results` | — | Parent output dir. A timestamped subfolder `YYYYMMDD_HHMMSS/` is created per run. |
 | `--list` | flag | — | List discoverable tests for the chosen scheme and exit. |
-| `--show-paths` | flag | — | Print the resolved `tank_config` / `metadata_dir` / `data_dir` / `method` / `window` / drops and exit. |
+| `--show-paths` | flag | — | Print the resolved `tank_config` / `metadata_dir` / `data_dir` / `probes_config` / `method` / `window` / `bandwidth` / drops / `freq_source` / `goda_pair` and exit. |
 | `-h`, `--help` | flag | — | Show help. |
 
 ### Typical workflows
@@ -130,6 +134,20 @@ python scripts/run_analysis.py --scheme rw --test all \
 # Turn on linear probe re-calibration (remembered until --no-recalibrate)
 python scripts/run_analysis.py --scheme rw --test all --recalibrate
 
+# Pre-reflection baseline sanity check — clip before any reflected front arrives.
+# True Kr should be ~0; residual Kr shows the separation method's intrinsic bias.
+# Outputs gain a `_noref` filename suffix so they don't clobber the normal run.
+python scripts/run_analysis.py --scheme rw --test all --window-mode noref
+
+# Evaluate the regular-wave DFT at exactly meta.f_Hz (no FFT bin snapping).
+# Persisted — subsequent rw runs keep using target-freq unless --freq-source bin.
+python scripts/run_analysis.py --scheme rw --test RW005 --freq-source target
+
+# Swap the Goda probe pair when the default (wp1 & wp3) sits on a singularity.
+# Persisted; ignored when --method least_squares.
+python scripts/run_analysis.py --scheme rw --test all \
+    --method goda --goda-pair 12
+
 # Inspect resolved configuration
 python scripts/run_analysis.py --show-paths
 
@@ -154,9 +172,31 @@ depend on scheme and selection:
 | `rw` with `--test all` (≥2 tests) | `rw_kr_vs_freq_<method>.csv`, `rw_report_<method>.html` |
 | `wn` or `js` (single test) | `<TEST>_<method>_spectrum.csv`, `<TEST>_<method>_report.html` |
 
+When `--window-mode noref` is set, a `_noref` suffix is inserted before the
+extension (e.g. `rw_kr_vs_freq_<method>_noref.csv`,
+`<TEST>_<method>_noref_report.html`) so baseline runs don't overwrite the
+reflection-inclusive ones.
+
 The HTML reports use **Chart.js** for interactive, tooltipped plots (Gantt of
 time windows, `Kr` vs frequency, incident/reflected spectra, singularity
 metric). They are self-contained — open directly in a browser.
+
+## Streamlit companion app
+
+`scripts/streamlit_app.py` is a browser UI over the same pipeline — pick
+scheme / test / method / window / head-tail drops / window-mode / freq-source
+from dropdowns, run the analysis in-process, and view or download the
+generated CSV + HTML report. The flag semantics mirror the CLI exactly, and it
+reads and writes the same persisted `~/.reflection_coefficient.json`.
+
+```bash
+pip install streamlit                           # optional dep, not in [dev]
+streamlit run scripts/streamlit_app.py
+```
+
+The app opens on `http://localhost:8501` by default. Pass `--server.port` or
+`--server.headless true` for remote / headless hosting (see `streamlit run
+--help`).
 
 ## Linear probe re-calibration
 

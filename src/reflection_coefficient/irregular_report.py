@@ -424,20 +424,24 @@ def write_irregular_report(
     out_dir: Path,
     method: str,
     timestamp: str | None = None,
+    window_mode: str = "canonical",
 ) -> Path:
     """Write the single-test irregular-wave report and supporting files.
 
     Returns the path to the generated HTML file.
     """
     win = _window_info(result, meta)
-    stem = f"{result.test_id}_{method}"
+    suffix = "" if window_mode == "canonical" else f"_{window_mode}"
+    stem = f"{result.test_id}_{method}{suffix}"
 
     csv_path = out_dir / f"{stem}_spectrum.csv"
     _write_spectrum_csv(result, csv_path)
 
+    mode_tag = "" if window_mode == "canonical" else f", {window_mode} window"
     header = (
         f"<h1>Irregular-wave reflection report — {html.escape(result.test_id)} "
-        f"({html.escape(meta.campaign)}, method: {html.escape(method)})</h1>"
+        f"({html.escape(meta.campaign)}, method: {html.escape(method)}"
+        f"{html.escape(mode_tag)})</h1>"
     )
     if timestamp:
         header += (

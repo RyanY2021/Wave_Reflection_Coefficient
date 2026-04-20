@@ -116,6 +116,40 @@ def test_mansard_funke_recovers_known_reflection():
     assert abs(a_R_est - a_R) / a_R < 0.02
 
 
+def test_goda_recovers_on_any_probe_pair():
+    """Each of the three two-probe combinations (1-3, 1-2, 2-3) must recover
+    the same known a_I, a_R from synthetic three-probe signals."""
+    f, depth, fs, duration = 0.8, 2.0, 100.0, 40.0
+    a_I, a_R, phi_R = 0.05, 0.02, 0.6
+    X12, X13 = 0.35, 0.90
+
+    t, e1, e2, e3 = _three_probe_elevations(
+        f, a_I, a_R, phi_R, X12, X13, depth, fs, duration
+    )
+    N = t.size
+    n_pos = N // 2 + 1
+    B1 = np.fft.fft(e1)[:n_pos]
+    B2 = np.fft.fft(e2)[:n_pos]
+    B3 = np.fft.fft(e3)[:n_pos]
+    df = fs / N
+    k_bin = int(round(f / df))
+    k_val, _ = solve_dispersion(f, depth)
+
+    for Bn, Bf, spacing in [
+        (B1[k_bin], B3[k_bin], X13),
+        (B1[k_bin], B2[k_bin], X12),
+        (B2[k_bin], B3[k_bin], X13 - X12),
+    ]:
+        Z_I, Z_R, valid = goda_separation(
+            np.array([Bn]), np.array([Bf]), np.array([k_val]), spacing,
+        )
+        assert valid[0]
+        a_I_est = abs(Z_I[0]) * 2.0 / N
+        a_R_est = abs(Z_R[0]) * 2.0 / N
+        assert abs(a_I_est - a_I) / a_I < 0.02, (spacing, a_I_est)
+        assert abs(a_R_est - a_R) / a_R < 0.02, (spacing, a_R_est)
+
+
 def test_singularity_masks_flag_bad_bins():
     # Spacing where k*X13 ≈ π → sin(kΔ) ≈ 0, two-probe method singular.
     f, depth = 0.8, 2.0
