@@ -42,7 +42,7 @@ from reflection_coefficient.io import (
 )
 from reflection_coefficient.irregular_report import write_irregular_report
 from reflection_coefficient.pipeline import IrregularResult, RegularResult, analyse
-from reflection_coefficient.rw_report import write_rw_report
+from reflection_coefficient.rw_report import singularity_metric, write_rw_report
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 _LOG_DIR = _PROJECT_ROOT / "log"
@@ -877,20 +877,23 @@ def _scratch_dir():
         shutil.rmtree(path, ignore_errors=True)
 
 
-def _write_kr_vs_freq(results, out_dir: Path, method: str,
+def _write_kr_vs_freq(pairs, out_dir: Path, method: str,
                       window_mode: str = "canonical") -> Path:
-    rows = sorted(results, key=lambda r: r.f_Hz)
+    rows = sorted(pairs, key=lambda p: p[0].f_Hz)
     suffix = "" if window_mode == "canonical" else f"_{window_mode}"
     csv_path = out_dir / f"rw_kr_vs_freq_{method}{suffix}.csv"
     with csv_path.open("w", newline="") as fh:
         w = csv.writer(fh)
         w.writerow(["test_id", "f_Hz", "k_rad_m", "L_m",
-                    "H_I_m", "H_R_m", "Kr", "singularity_ok"])
-        for r in rows:
+                    "a_I_m", "a_R_m", "Kr",
+                    "singularity_metric", "singularity_threshold"])
+        for r, meta in rows:
+            sing, thr, _ = singularity_metric(r, meta, method)
             w.writerow([r.test_id, f"{r.f_Hz:.6f}", f"{r.k:.6f}",
-                        f"{r.wavelength_m:.6f}", f"{r.H_I:.6f}",
-                        f"{r.H_R:.6f}", f"{r.Kr:.6f}",
-                        int(r.singularity_ok)])
+                        f"{r.wavelength_m:.6f}",
+                        f"{r.a_I:.6f}", f"{r.a_R:.6f}",
+                        f"{r.Kr:.6f}",
+                        f"{sing:.6f}", f"{thr:g}"])
     return csv_path
 
 
@@ -1094,12 +1097,16 @@ def _summary_strip(scheme: str, method: str, window: str, bandwidth: float,
         f' · pair <code>{_html.escape(goda_pair)}</code>'
         if method == "goda" else ""
     )
+    window_chip = (
+        f'window <code>{_html.escape(window)}</code> ({bw}) · '
+        if scheme != "rw" else ""
+    )
     recal_chip = ' · <code>recalibrated</code>' if recalibrate else ""
     return (
         f'<div class="rc-summary-strip">'
         f'<span><code>{_html.escape(_SCHEME_LABELS[scheme])}</code> · '
         f'<code>{tests}</code> · <code>{method}</code>{pair_chip} · '
-        f'window <code>{window}</code> ({bw}) · '
+        f'{window_chip}'
         f'head <code>{head:g}s</code> tail <code>{tail:g}s</code>'
         f'{mode_chip}{freq_chip}{recal_chip}</span>'
         f'<span>edit below</span>'
@@ -1216,12 +1223,28 @@ method = c1.selectbox(
     "Method", ["least_squares", "goda"],
     help="Goda: 2 probes. Mansard–Funke (least_squares): 3 probes, more robust.",
 )
-window = c2.selectbox("Window", ["hann", "none"])
-bandwidth = c3.number_input("Bandwidth (Hz)", value=0.04, step=0.01,
-                            format="%.3f")
+window = c2.selectbox(
+    "Window", ["hann", "none"],
+    help=(
+        "Irregular-wave only. FFT taper applied before the spectral "
+        "separation. 'hann' is the Goda / Mansard–Funke default; 'none' "
+        "lets you cross-check leakage. Regular-wave analysis uses a "
+        "single-bin DFT and ignores this."
+    ),
+    disabled=(scheme == "rw"),
+)
+bandwidth = c3.number_input(
+    "Bandwidth (Hz)", value=0.04, step=0.01, format="%.3f",
+    help=(
+        "Irregular-wave only. Target resolution bandwidth for the "
+        "band-average (Kr(f) curve smoothing). Ignored for regular waves."
+    ),
+    disabled=(scheme == "rw"),
+)
 st.markdown(
-    '<p class="rc-caption">Bandwidth controls the irregular-wave band-average. '
-    'Smaller values give finer Kr(f) resolution but noisier curves.</p>',
+    '<p class="rc-caption">Window and bandwidth apply to irregular waves '
+    '(wn / js); regular waves use a single-bin DFT and ignore both. '
+    'Smaller bandwidth gives finer Kr(f) resolution but noisier curves.</p>',
     unsafe_allow_html=True,
 )
 
@@ -1415,8 +1438,8 @@ if run_clicked:
 
             if scheme == "rw" and len(regular_results) >= 2:
                 csv_path = _write_kr_vs_freq(
-                    regular_results, tmp_path, method,
-                    window_mode=window_mode,
+                    list(zip(regular_results, regular_metas)),
+                    tmp_path, method, window_mode=window_mode,
                 )
                 hp = write_rw_report(
                     list(zip(regular_results, regular_metas)),

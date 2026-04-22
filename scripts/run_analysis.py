@@ -23,6 +23,7 @@ from pathlib import Path
 from reflection_coefficient.calibration import recalibrate_probes
 from reflection_coefficient.io import (
     USER_CONFIG_PATH,
+    TestMeta,
     list_tests,
     load_probe_data,
     load_probes_config,
@@ -46,7 +47,7 @@ from reflection_coefficient.io import (
 )
 from reflection_coefficient.irregular_report import write_irregular_report
 from reflection_coefficient.pipeline import IrregularResult, RegularResult, analyse
-from reflection_coefficient.rw_report import write_rw_report
+from reflection_coefficient.rw_report import singularity_metric, write_rw_report
 
 SCHEME_LABELS = {
     "rw": "REGULAR WAVE",
@@ -400,7 +401,8 @@ def _run(args) -> None:
     if scheme == "rw" and len(regular_results) >= 2:
         out = _ensure_run_dir()
         csv_path = _write_kr_vs_freq(
-            regular_results, out, args.method, window_mode=args.window_mode,
+            list(zip(regular_results, regular_metas)),
+            out, args.method, window_mode=args.window_mode,
         )
         html_path = write_rw_report(
             list(zip(regular_results, regular_metas)),
@@ -430,20 +432,24 @@ def _report(result: RegularResult | IrregularResult) -> None:
 
 
 def _write_kr_vs_freq(
-    results: list[RegularResult], out_dir: Path, method: str,
+    pairs: list[tuple[RegularResult, TestMeta]], out_dir: Path, method: str,
     window_mode: str = "canonical",
 ) -> Path:
     """Aggregate regular-wave runs into a Kr(f) CSV table and return its path."""
-    rows = sorted(results, key=lambda r: r.f_Hz)
+    rows = sorted(pairs, key=lambda p: p[0].f_Hz)
     suffix = "" if window_mode == "canonical" else f"_{window_mode}"
     csv_path = out_dir / f"rw_kr_vs_freq_{method}{suffix}.csv"
     with csv_path.open("w", newline="") as fh:
         w = csv.writer(fh)
-        w.writerow(["test_id", "f_Hz", "k_rad_m", "L_m", "H_I_m", "H_R_m", "Kr", "singularity_ok"])
-        for r in rows:
+        w.writerow(["test_id", "f_Hz", "k_rad_m", "L_m",
+                    "a_I_m", "a_R_m", "Kr",
+                    "singularity_metric", "singularity_threshold"])
+        for r, meta in rows:
+            sing, thr, _ = singularity_metric(r, meta, method)
             w.writerow([
                 r.test_id, f"{r.f_Hz:.6f}", f"{r.k:.6f}", f"{r.wavelength_m:.6f}",
-                f"{r.H_I:.6f}", f"{r.H_R:.6f}", f"{r.Kr:.6f}", int(r.singularity_ok),
+                f"{r.a_I:.6f}", f"{r.a_R:.6f}", f"{r.Kr:.6f}",
+                f"{sing:.6f}", f"{thr:g}",
             ])
     print(f"[run_analysis] wrote {csv_path}")
     return csv_path

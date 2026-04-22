@@ -21,7 +21,34 @@ from .io import TestMeta
 from .pipeline import RegularResult
 
 
-def _row_for(result: RegularResult, meta: TestMeta) -> dict:
+def singularity_metric(result: RegularResult, meta: TestMeta,
+                        method: str) -> tuple[float, float, str]:
+    """Return ``(metric, threshold, label)`` for the per-test singularity check.
+
+    Mirrors the formulas used inside :func:`pipeline.analyse_regular` so the
+    value plotted alongside K_r is exactly the quantity the mask compares to.
+    """
+    k = result.k
+    X12 = float(meta.X12_m or 0.0)
+    X13 = float(meta.X13_m or 0.0)
+    if method == "goda":
+        pair = result.goda_pair
+        if pair == "12":
+            spacing, label = X12, "sin²(k·X12)  (Goda, pair 12)"
+        elif pair == "23":
+            spacing, label = (X13 - X12), "sin²(k·(X13−X12))  (Goda, pair 23)"
+        else:
+            spacing, label = X13, "sin²(k·X13)  (Goda, pair 13)"
+        metric = math.sin(k * spacing) ** 2
+        return metric, 0.05, label
+    sb = math.sin(k * X12)
+    sg = math.sin(k * X13)
+    sgb = math.sin(k * X13 - k * X12)
+    metric = 2.0 * (sb * sb + sg * sg + sgb * sgb)
+    return metric, 0.1, "D  (Mansard–Funke)"
+
+
+def _row_for(result: RegularResult, meta: TestMeta, method: str) -> dict:
     """Build a report row from a pipeline result.
 
     All time-window quantities come from the pipeline (``analyse_regular``)
@@ -38,6 +65,7 @@ def _row_for(result: RegularResult, meta: TestMeta) -> dict:
         status += "_FEW"
     if not result.singularity_ok:
         status += "+SING"
+    sing_metric, sing_threshold, sing_label = singularity_metric(result, meta, method)
     return {
         "test_id": result.test_id,
         "f": f, "T": T, "L": result.wavelength_m,
@@ -50,8 +78,11 @@ def _row_for(result: RegularResult, meta: TestMeta) -> dict:
         "head_drop": result.head_drop_s,
         "tail_drop": result.tail_drop_s,
         "t_use": t_ana, "n_per": n_per,
+        "a_I": result.a_I, "a_R": result.a_R,
         "H_I": result.H_I, "H_R": result.H_R, "Kr": result.Kr,
         "status": status, "singularity_ok": result.singularity_ok,
+        "sing_metric": sing_metric, "sing_threshold": sing_threshold,
+        "sing_label": sing_label,
     }
 
 
@@ -169,7 +200,7 @@ def _table(rows: list[dict]) -> str:
         "t<sub>gen</sub> (s)", "t<sub>start</sub> (s)", "t<sub>end</sub> (s)",
         "head drop (s)", "tail drop (s)",
         "T<sub>usable</sub> (s)", "N<sub>per</sub>",
-        "H<sub>I</sub> (m)", "H<sub>R</sub> (m)", "K<sub>r</sub>", "Status",
+        "a<sub>I</sub> (m)", "a<sub>R</sub> (m)", "Status",
     ]
     th = "".join(
         f'<th style="padding:6px 6px;text-align:right;font-weight:500;font-size:11px;'
@@ -188,7 +219,7 @@ def _table(rows: list[dict]) -> str:
             f"{r['head_drop']:.1f}", f"{r['tail_drop']:.1f}",
             f"{r['t_use']:.1f}" if r["t_use"] > 0 else "—",
             f"{r['n_per']:.1f}" if r["n_per"] > 0 else "—",
-            f"{r['H_I']:.4f}", f"{r['H_R']:.4f}", f"{r['Kr']:.3f}",
+            f"{r['a_I']:.5f}", f"{r['a_R']:.5f}",
         ]
         tds = "".join(
             f'<td style="padding:4px 6px;text-align:right;font-family:var(--font-mono);'
@@ -328,13 +359,19 @@ def _gantt_canvas(rows: list[dict]) -> str:
 
 
 def _kr_chart_canvas(rows: list[dict]) -> str:
-    """Interactive Kr-vs-f line chart."""
+    """Interactive Kr-vs-f line chart with singularity metric on a second y-axis."""
+    sing_label = rows[0]["sing_label"] if rows else "singularity"
+    sing_threshold = rows[0]["sing_threshold"] if rows else 0.0
     data = [
         {"f": r["f"], "Kr": r["Kr"], "ok": bool(r["singularity_ok"]),
-         "test_id": r["test_id"], "H_I": r["H_I"], "H_R": r["H_R"]}
+         "test_id": r["test_id"],
+         "a_I": r["a_I"], "a_R": r["a_R"],
+         "H_I": r["H_I"], "H_R": r["H_R"],
+         "sing": r["sing_metric"]}
         for r in rows
     ]
-    payload = json.dumps(data)
+    data_sorted = sorted(data, key=lambda d: d["f"])
+    payload = json.dumps(data_sorted)
     return f"""
 <div style="position:relative;width:100%;height:420px;
      background:var(--color-background-secondary);
@@ -343,25 +380,36 @@ def _kr_chart_canvas(rows: list[dict]) -> str:
 </div>
 <script>(function(){{
   const rows = {payload};
-  const points = rows.map(r => ({{x:r.f, y:r.Kr}}));
-  const flagged = rows.filter(r => !r.ok).map(r => ({{x:r.f, y:r.Kr}}));
+  const krPts    = rows.map(r => ({{x:r.f, y:r.Kr}}));
+  const singPts  = rows.map(r => ({{x:r.f, y:r.sing}}));
+  const flagged  = rows.filter(r => !r.ok).map(r => ({{x:r.f, y:r.Kr}}));
+  const threshold = {sing_threshold};
   new Chart(document.getElementById('krChart'), {{
     type:'line',
     data:{{datasets:[
-      {{label:'K_r', data:points, borderColor:'#3266ad', backgroundColor:'#3266ad',
-        pointRadius:4, pointHoverRadius:6, tension:0.1, fill:false}},
+      {{label:'K_r', data:krPts, borderColor:'#3266ad', backgroundColor:'#3266ad',
+        pointRadius:4, pointHoverRadius:6, tension:0.1, fill:false, yAxisID:'yKr'}},
+      {{label:{json.dumps(sing_label)}, data:singPts,
+        borderColor:'#5f5e5a', backgroundColor:'#5f5e5a',
+        pointRadius:3, pointHoverRadius:5, borderDash:[4,3],
+        borderWidth:1.2, tension:0.1, fill:false, yAxisID:'ySing'}},
       {{label:'Singularity flagged', data:flagged, type:'scatter',
         borderColor:'#A32D2D', backgroundColor:'#A32D2D',
-        pointStyle:'crossRot', pointRadius:8, pointHoverRadius:10, showLine:false}}
+        pointStyle:'crossRot', pointRadius:8, pointHoverRadius:10,
+        showLine:false, yAxisID:'yKr'}}
     ]}},
     options:{{
       responsive:true, maintainAspectRatio:false,
+      interaction:{{mode:'nearest', axis:'x', intersect:false}},
       plugins:{{
         legend:{{labels:{{boxWidth:12}}}},
         tooltip:{{callbacks:{{
           label:(ctx)=>{{
             const r = rows[ctx.dataIndex];
+            if(ctx.dataset.yAxisID==='ySing')
+              return r.test_id+':  '+ctx.dataset.label+' = '+r.sing.toFixed(4);
             return [r.test_id+':  K_r = '+r.Kr.toFixed(3),
+                    'a_I = '+r.a_I.toFixed(5)+' m,  a_R = '+r.a_R.toFixed(5)+' m',
                     'H_I = '+r.H_I.toFixed(4)+' m,  H_R = '+r.H_R.toFixed(4)+' m',
                     r.ok ? '' : '⚠ singularity flagged'].filter(Boolean);
           }}
@@ -369,9 +417,31 @@ def _kr_chart_canvas(rows: list[dict]) -> str:
       }},
       scales:{{
         x:{{type:'linear', title:{{display:true,text:'f (Hz)'}}}},
-        y:{{title:{{display:true,text:'K_r'}}, beginAtZero:true}}
+        yKr:{{type:'linear', position:'left',
+              title:{{display:true,text:'K_r',color:'#3266ad'}},
+              ticks:{{color:'#3266ad'}}, beginAtZero:true}},
+        ySing:{{type:'linear', position:'right',
+                title:{{display:true,text:{json.dumps(sing_label)},color:'#5f5e5a'}},
+                ticks:{{color:'#5f5e5a'}}, beginAtZero:true,
+                grid:{{drawOnChartArea:false}}}}
       }}
-    }}
+    }},
+    plugins:[{{
+      id:'singThreshold',
+      afterDraw(chart){{
+        const ctx = chart.ctx, yS = chart.scales.ySing, area = chart.chartArea;
+        if(!yS) return;
+        const yp = yS.getPixelForValue(threshold);
+        if(yp < area.top || yp > area.bottom) return;
+        ctx.save();
+        ctx.strokeStyle = '#A32D2D'; ctx.lineWidth = 1; ctx.setLineDash([2,3]);
+        ctx.beginPath(); ctx.moveTo(area.left, yp); ctx.lineTo(area.right, yp); ctx.stroke();
+        ctx.restore();
+        ctx.fillStyle = '#A32D2D';
+        ctx.font = '10px ' + getComputedStyle(document.body).fontFamily;
+        ctx.fillText('singularity threshold = '+threshold, area.left+6, yp-4);
+      }}
+    }}]
   }});
 }})();</script>
 """
@@ -425,7 +495,7 @@ def write_rw_report(
     if not pairs:
         raise ValueError("write_rw_report: no results to report")
     meta = pairs[0][1]
-    rows = [_row_for(r, m) for r, m in pairs]
+    rows = [_row_for(r, m, method) for r, m in pairs]
     rows.sort(key=lambda r: r["f"])
 
     mode_tag = "" if window_mode == "canonical" else f" — {window_mode} window"
@@ -455,7 +525,7 @@ def write_rw_report(
         _table(rows),
         "<h2>Time-window breakdown</h2>",
         _gantt_canvas(rows),
-        "<h2>K<sub>r</sub> vs frequency</h2>",
+        "<h2>K<sub>r</sub> vs frequency & singularity metric</h2>",
         _kr_chart_canvas(rows),
         "<h2>Result CSV</h2>",
         _csv_block(csv_path),
