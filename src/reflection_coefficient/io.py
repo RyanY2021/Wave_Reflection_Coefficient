@@ -214,7 +214,7 @@ def save_recalibrate(flag: bool) -> None:
     _save_user_config(cfg)
 
 
-def resolve_recalibrate(explicit: bool | None, default: bool = False) -> bool:
+def resolve_recalibrate(explicit: bool | None, default: bool = True) -> bool:
     """Resolve the recalibration flag from CLI / stored / default."""
     if explicit is not None:
         return bool(explicit)

@@ -130,7 +130,7 @@ def main() -> None:
         help=(
             "Apply per-probe linear re-calibration from probes.json after "
             "loading. Use --no-recalibrate to disable. Persisted when set "
-            "(default: off)."
+            "(default: on)."
         ),
     )
     parser.add_argument(
