@@ -23,6 +23,7 @@ Thumbs.db
 # Project
 results/
 docs/
+bin/
 experiment_data/
 notebooks/
 log/
