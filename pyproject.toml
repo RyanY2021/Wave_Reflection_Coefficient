@@ -24,6 +24,8 @@ dev = [
     "ruff",
 ]
 
+app = ["streamlit"]
+
 [tool.setuptools.packages.find]
 where = ["src"]
 

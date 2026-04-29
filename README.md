@@ -52,6 +52,23 @@ pytest tests/test_smoke.py::test_version    # single test
 ruff check .
 ```
 
+### Quicker setup with `uv` (optional)
+
+[`uv`](https://docs.astral.sh/uv/) (`brew install uv` on macOS) is a drop-in
+replacement for `pip` + `venv` that's 10–100× faster and skips the activation
+step:
+
+```bash
+uv venv                              # create .venv/
+uv pip install -e ".[dev]"           # editable install + dev extras
+uv run pytest                        # run any command without activating
+uv run python scripts/run_analysis.py --show-paths
+```
+
+The rest of this README uses the canonical `python` / `pip` invocations that
+work on any machine; if you've gone the uv route, prefix the analysis
+commands with `uv run` (e.g. `uv run python scripts/run_analysis.py ...`).
+
 ## Project initialization
 
 `experiment_data/` is gitignored, so a fresh clone has no tank config or
