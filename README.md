@@ -52,6 +52,23 @@ pytest tests/test_smoke.py::test_version    # single test
 ruff check .
 ```
 
+### Quicker setup with `uv` (optional)
+
+[`uv`](https://docs.astral.sh/uv/) (`brew install uv` on macOS) is a drop-in
+replacement for `pip` + `venv` that's 10–100× faster and skips the activation
+step:
+
+```bash
+uv venv                              # create .venv/
+uv pip install -e ".[dev]"           # editable install + dev extras
+uv run pytest                        # run any command without activating
+uv run python scripts/run_analysis.py --show-paths
+```
+
+The rest of this README uses the canonical `python` / `pip` invocations that
+work on any machine; if you've gone the uv route, prefix the analysis
+commands with `uv run` (e.g. `uv run python scripts/run_analysis.py ...`).
+
 ## Project initialization
 
 `experiment_data/` is gitignored, so a fresh clone has no tank config or
@@ -96,7 +113,7 @@ Path inputs and analysis choices are **persisted per-user** in
 | `--bandwidth HZ` | default: `0.04` | ✔ | Target resolution bandwidth in Hz for band-averaging (only meaningful with `--window hann`). |
 | `--head-drop SEC` | default: `3.0` | ✔ | Seconds to trim from the **start** of the clean analysis window, so the FFT skips ramp-up transients. |
 | `--tail-drop SEC` | default: `3.0` | ✔ | Seconds to trim from the **end** of the clean analysis window, so the FFT skips ramp-down transients. |
-| `--recalibrate` / `--no-recalibrate` | default: off | ✔ | Apply the per-probe linear re-calibration from `probes.json` after loading. See [Linear probe re-calibration](#linear-probe-re-calibration). |
+| `--recalibrate` / `--no-recalibrate` | default: on | ✔ | Apply the per-probe linear re-calibration from `probes.json` after loading. Use `--no-recalibrate` to disable. See [Linear probe re-calibration](#linear-probe-re-calibration). |
 | `--window-mode {canonical,noref}` | default: `canonical` | — | Clip-window selection. `canonical` uses the full reflection-inclusive travel-time window from `docs/reflection_processing_pipeline.md` §2.1; `noref` uses a pre-reflection window ending before the first reflected front returns to probe 1, for a baseline sanity check where the true `Kr` should be zero. Explicit diagnostic — not persisted. Outputs gain a `_noref` filename suffix. |
 | `--freq-source {bin,target}` | default: `bin` | ✔ | Regular-wave only. `bin` uses the nearest FFT bin to `meta.f_Hz` (fastest, bin-quantised); `target` evaluates the DFT at exactly the target frequency from metadata via a single-point `Σ x[n]·exp(-i·2π·f·n/fs)`, eliminating bin-quantisation error. Ignored for `wn` / `js`. |
 | `--goda-pair {13,12,23}` | default: `13` | ✔ | Goda-only. Which two probes feed the two-probe separation: `13` = wp1 + wp3 (widest spacing, default), `12` = wp1 + wp2, `23` = wp2 + wp3 (spacing `X13 − X12`). Changing Δ moves the `kΔ = nπ` singularities in frequency — useful when the default pair sits on a near-singular bin for a given test. Ignored when `--method least_squares`. |
