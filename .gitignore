@@ -20,6 +20,8 @@ venv/
 .DS_Store
 Thumbs.db
 CLAUDE.md
+.claude/
+.impeccable*
 
 # Project
 results/
@@ -28,6 +30,7 @@ experiment_data/
 notebooks/
 log/
 *.log
+bin/
 
 # Config
 .*.json
