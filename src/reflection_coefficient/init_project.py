@@ -18,6 +18,7 @@ import json
 from pathlib import Path
 
 from .io import (
+    resolve_cn_config,
     resolve_data_dir,
     resolve_metadata_dir,
     resolve_probes_config,
@@ -54,6 +55,22 @@ _PROBES_CONFIG_TEMPLATE: dict = {
     "wp3": {"scale_old": 1.0, "offset_old": 0.0, "scale_new": 1.0, "offset_new": 0.0},
 }
 
+_CN_CONFIG_TEMPLATE: dict = {
+    "_doc": (
+        "Per-probe complex correction C_n(f) = alpha_n * "
+        "exp(-i k Delta_x_n - i omega Delta_t_n). Probe 1 is the reference "
+        "(C_1 = 1). Convention: numpy e^{-iwt}. PLACEHOLDER identity values; "
+        "run `run_analysis.py --scheme rw --test all --window-mode noref "
+        "--cn-fit` to populate from a noref-window fit. Apply with --cn-apply."
+    ),
+    "convention": {"fft_sign": "numpy_minus_iwt", "reference_probe": "wp1"},
+    "fit_meta": {"_note": "placeholder; not fitted from data"},
+    "wp1": {"alpha": 1.0, "delta_x_m": 0.0, "delta_t_s": 0.0,
+            "_note": "reference probe; identity by definition"},
+    "wp2": {"alpha": 1.0, "delta_x_m": 0.0, "delta_t_s": 0.0},
+    "wp3": {"alpha": 1.0, "delta_x_m": 0.0, "delta_t_s": 0.0},
+}
+
 _METADATA_HEADERS: dict[str, list[str]] = {
     "rw": ["test_id", "f_Hz", "a_target_m", "t_gen_s", "notes"],
     "wn": ["test_id", "S0_m2_Hz", "f_min_Hz", "f_max_Hz", "t_gen_s", "notes"],
@@ -75,6 +92,7 @@ def init_project(
     metadata_dir: Path | str | None = None,
     data_dir: Path | str | None = None,
     probes_config: Path | str | None = None,
+    cn_config: Path | str | None = None,
     force: bool = False,
 ) -> list[str]:
     """Create the input scaffold. Returns a list of human-readable actions."""
@@ -82,6 +100,7 @@ def init_project(
     meta_dir = resolve_metadata_dir(metadata_dir)
     dat_dir = resolve_data_dir(data_dir)
     probes_path = resolve_probes_config(probes_config)
+    cn_path = resolve_cn_config(cn_config)
 
     actions: list[str] = []
 
@@ -91,6 +110,10 @@ def init_project(
 
     actions.append(_write_if_absent(
         probes_path, json.dumps(_PROBES_CONFIG_TEMPLATE, indent=2) + "\n", force,
+    ))
+
+    actions.append(_write_if_absent(
+        cn_path, json.dumps(_CN_CONFIG_TEMPLATE, indent=2) + "\n", force,
     ))
 
     for scheme, cols in _METADATA_HEADERS.items():

@@ -508,6 +508,13 @@ def write_rw_report(
             f'<p style="color:var(--color-text-secondary);margin-bottom:1rem;">'
             f'Generated {html.escape(timestamp)} — {len(rows)} test(s)</p>'
         )
+    first_result = pairs[0][0]
+    if getattr(first_result, "cn_applied", False):
+        header += (
+            f'<p style="color:var(--color-text-secondary);margin-bottom:1rem;'
+            f'font-style:italic;">Per-probe complex correction C<sub>n</sub> '
+            f'applied (mode: {html.escape(first_result.cn_mode)}).</p>'
+        )
 
     layout_block = (
         '<div style="background:var(--color-background-secondary);'

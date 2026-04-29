@@ -442,6 +442,12 @@ def write_irregular_report(
             f'<p style="color:var(--color-text-secondary);margin-bottom:1rem;">'
             f'Generated {html.escape(timestamp)}</p>'
         )
+    if getattr(result, "cn_applied", False):
+        header += (
+            f'<p style="color:var(--color-text-secondary);margin-bottom:1rem;'
+            f'font-style:italic;">Per-probe complex correction C<sub>n</sub> '
+            f'applied (mode: {html.escape(result.cn_mode)}).</p>'
+        )
 
     layout_block = (
         '<div style="background:var(--color-background-secondary);'

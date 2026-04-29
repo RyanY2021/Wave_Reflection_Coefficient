@@ -21,12 +21,20 @@ from datetime import datetime
 from pathlib import Path
 
 from reflection_coefficient.calibration import recalibrate_probes
+from reflection_coefficient.cn_correction import (
+    fit_cn_from_records,
+    load_cn_config,
+    save_cn_config,
+)
 from reflection_coefficient.io import (
     USER_CONFIG_PATH,
     TestMeta,
     list_tests,
     load_probe_data,
     load_probes_config,
+    resolve_cn_apply,
+    resolve_cn_config,
+    resolve_cn_mode,
     resolve_data_dir,
     resolve_drops,
     resolve_freq_source,
@@ -37,6 +45,8 @@ from reflection_coefficient.io import (
     resolve_recalibrate,
     resolve_tank_config,
     resolve_window,
+    save_cn_apply,
+    save_cn_mode,
     save_drops,
     save_freq_source,
     save_goda_pair,
@@ -46,7 +56,12 @@ from reflection_coefficient.io import (
     save_window,
 )
 from reflection_coefficient.irregular_report import write_irregular_report
-from reflection_coefficient.pipeline import IrregularResult, RegularResult, analyse
+from reflection_coefficient.pipeline import (
+    IrregularResult,
+    RegularResult,
+    analyse,
+    extract_regular_bins,
+)
 from reflection_coefficient.rw_report import singularity_metric, write_rw_report
 
 SCHEME_LABELS = {
@@ -196,6 +211,44 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--cn-config", type=Path, default=None,
+        help=(
+            "Per-probe complex correction JSON (default: "
+            "experiment_data/probes_refined.json). Persisted when set. "
+            "Consumed when --cn-apply is on; written by --cn-fit."
+        ),
+    )
+    parser.add_argument(
+        "--cn-fit", action="store_true",
+        help=(
+            "Fit per-probe complex correction C_n(f) = alpha * exp(-i k Δx "
+            "- i ω Δt) from the noref window across the selected tests, then "
+            "write the result to --cn-config (default probes_refined.json). "
+            "Requires --window-mode noref. For --scheme rw, fitting needs "
+            "--test all so the (k, ω) regression is well-conditioned. "
+            "Not persisted (action-only)."
+        ),
+    )
+    parser.add_argument(
+        "--cn-apply", default=None,
+        action=argparse.BooleanOptionalAction,
+        help=(
+            "Apply the per-probe complex correction from --cn-config to FFT "
+            "bins before separation. Use --no-cn-apply to disable. Persisted "
+            "when set (default: off — opt-in, since a stale fit silently "
+            "corrupts separation)."
+        ),
+    )
+    parser.add_argument(
+        "--cn-mode", choices=["amp", "phase", "both"], default=None,
+        help=(
+            "Which component of C_n to apply: 'amp' (alpha only, Variant B), "
+            "'phase' (Δx + Δt only, Variant C), or 'both' (Variant D, full "
+            "fit). Persisted when set (default: both). Ignored when "
+            "--cn-apply is off."
+        ),
+    )
+    parser.add_argument(
         "--list", action="store_true",
         help="List tests discovered for the chosen scheme and exit.",
     )
@@ -239,13 +292,15 @@ def _run(args) -> None:
     # Persist any explicitly provided paths before resolving (so the saved
     # values are available to later invocations regardless of errors below).
     if any(v is not None for v in (
-        args.tank_config, args.metadata_dir, args.data_dir, args.probes_config,
+        args.tank_config, args.metadata_dir, args.data_dir,
+        args.probes_config, args.cn_config,
     )):
         save_paths(
             tank_config=args.tank_config,
             metadata_dir=args.metadata_dir,
             data_dir=args.data_dir,
             probes_config=args.probes_config,
+            cn_config=args.cn_config,
         )
         print(f"[run_analysis] updated saved paths in {USER_CONFIG_PATH}")
 
@@ -273,16 +328,26 @@ def _run(args) -> None:
         save_recalibrate(args.recalibrate)
     args.recalibrate = resolve_recalibrate(args.recalibrate)
 
+    if args.cn_apply is not None:
+        save_cn_apply(args.cn_apply)
+    args.cn_apply = resolve_cn_apply(args.cn_apply)
+
+    if args.cn_mode is not None:
+        save_cn_mode(args.cn_mode)
+    args.cn_mode = resolve_cn_mode(args.cn_mode)
+
     tank_cfg = resolve_tank_config(args.tank_config)
     meta_dir = resolve_metadata_dir(args.metadata_dir)
     data_dir = resolve_data_dir(args.data_dir)
     probes_cfg_path = resolve_probes_config(args.probes_config)
+    cn_config_path = resolve_cn_config(args.cn_config)
 
     if args.show_paths:
         print(f"  tank_config   = {tank_cfg}")
         print(f"  metadata_dir  = {meta_dir}")
         print(f"  data_dir      = {data_dir}")
         print(f"  probes_config = {probes_cfg_path}")
+        print(f"  cn_config     = {cn_config_path}")
         print(f"  method        = {args.method}")
         bw_txt = f"{args.bandwidth:g} Hz" if args.bandwidth is not None else "—"
         print(f"  window        = {args.window}  (bandwidth: {bw_txt})")
@@ -291,6 +356,8 @@ def _run(args) -> None:
             f"tail {args.tail_drop:g} s"
         )
         print(f"  recalibrate   = {'on' if args.recalibrate else 'off'}")
+        print(f"  cn_apply      = {'on' if args.cn_apply else 'off'} "
+              f"(mode: {args.cn_mode})")
         print(f"  freq_source   = {args.freq_source}")
         print(f"  goda_pair     = {args.goda_pair}")
         return
@@ -311,19 +378,75 @@ def _run(args) -> None:
             sys.exit(1)
         probes_cfg = load_probes_config(probes_cfg_path)
 
+    # cn-fit / cn-apply mutually exclusive within one invocation: do one or
+    # the other, not both. The fit consumes raw bins; applying first would
+    # absorb the existing correction into the new fit and produce identity.
+    if args.cn_fit and args.cn_apply:
+        print(
+            "[run_analysis] --cn-fit and --cn-apply cannot be combined in one "
+            "run. Fit produces a new probes_refined.json; apply consumes it. "
+            "Run them as two separate commands.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    if args.cn_fit and args.window_mode != "noref":
+        print(
+            "[run_analysis] --cn-fit requires --window-mode noref "
+            "(the fit assumes a_R = 0; the canonical window has reflection).",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    cn_config_data = None
+    if args.cn_apply:
+        if not cn_config_path.exists():
+            print(
+                f"[run_analysis] --cn-apply requires a cn config at "
+                f"{cn_config_path} (run scripts/init_project.py to scaffold "
+                f"a placeholder, or --cn-fit to produce a real one).",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        cn_config_data = load_cn_config(cn_config_path)
+        fitted_with = cn_config_data.get("fit_meta", {}).get(
+            "fitted_with_recalibrate"
+        )
+        if fitted_with is not None and bool(fitted_with) != bool(args.recalibrate):
+            print(
+                f"[run_analysis] WARNING: --cn-apply config was fitted with "
+                f"recalibrate={'on' if fitted_with else 'off'} but current "
+                f"--recalibrate is {'on' if args.recalibrate else 'off'}. "
+                f"Results may be biased. Re-fit with the matching setting.",
+                file=sys.stderr,
+            )
+
     scheme = args.scheme or _prompt_choice(
         "Select wave scheme for this run:", ("rw", "wn", "js")
     )
+
+    if args.cn_fit and scheme != "rw":
+        print(
+            "[run_analysis] --cn-fit currently supports --scheme rw only. "
+            "Single-record irregular fitting is a planned follow-up.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     bw_txt = f"{args.bandwidth:g} Hz" if args.bandwidth is not None else "—"
     pair_txt = (
         f" | goda_pair={args.goda_pair}" if args.method == "goda" else ""
     )
+    cn_txt = (
+        " | cn=fit"
+        if args.cn_fit
+        else f" | cn=on({args.cn_mode})" if args.cn_apply else ""
+    )
     banner = (
         f" {SCHEME_LABELS[scheme]} | method={args.method}{pair_txt} "
         f"| window={args.window} (bw {bw_txt}) "
         f"| drops head {args.head_drop:g}s tail {args.tail_drop:g}s "
-        f"| recalibrate={'on' if args.recalibrate else 'off'} "
+        f"| recalibrate={'on' if args.recalibrate else 'off'}{cn_txt} "
         f"| mode={args.window_mode} | freq={args.freq_source} "
     )
     print("=" * len(banner))
@@ -353,6 +476,16 @@ def _run(args) -> None:
         print(f"Test {args.test!r} not found under {data_dir}.", file=sys.stderr)
         sys.exit(2)
 
+    if args.cn_fit and len(selected) < 4:
+        print(
+            f"[run_analysis] WARNING: --cn-fit selected {len(selected)} test(s); "
+            f"the (k, ω) regression is rank-2 so at least ~4 distinct frequencies "
+            f"are needed for a reliable Δx and Δt. With fewer, alpha is fine but "
+            f"the phase fit will be ill-conditioned. Pass --test all on a richer "
+            f"campaign for a robust fit.",
+            file=sys.stderr,
+        )
+
     _project_root = Path(__file__).resolve().parents[1]
     output_parent = args.output if args.output is not None else _project_root / "results"
     run_dir = output_parent / datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -365,6 +498,9 @@ def _run(args) -> None:
 
     regular_results: list[RegularResult] = []
     regular_metas: list = []
+    cn_records: list[dict] = []
+    cn_test_ids: list[str] = []
+    cn_geometry: tuple[float, float] | None = None
     for tid in selected:
         t, eta1, eta2, eta3, meta = load_probe_data(
             tid, campaign=scheme,
@@ -382,6 +518,8 @@ def _run(args) -> None:
                 window_mode=args.window_mode,
                 freq_source=args.freq_source,
                 goda_pair=args.goda_pair,
+                cn_config=cn_config_data,
+                cn_mode=args.cn_mode,
             )
         except Exception as exc:
             print(f"  !! {tid}: {exc}", file=sys.stderr)
@@ -398,6 +536,26 @@ def _run(args) -> None:
             )
             print(f"[run_analysis] wrote {html_path}")
 
+        # Accumulate FFT bins for the cn-fit branch (regular path only).
+        if args.cn_fit and scheme == "rw":
+            try:
+                f_used, k_val, b1, b2, b3 = extract_regular_bins(
+                    t, eta1, eta2, eta3, meta,
+                    head_drop_s=args.head_drop, tail_drop_s=args.tail_drop,
+                    window_mode=args.window_mode,
+                    freq_source=args.freq_source,
+                )
+            except Exception as exc:
+                print(f"  !! {tid} (cn_fit): {exc}", file=sys.stderr)
+            else:
+                cn_records.append({
+                    "f": [f_used], "k": [k_val],
+                    "B1": [b1], "B2": [b2], "B3": [b3],
+                    "f_peak_Hz": float(meta.f_Hz),
+                })
+                cn_test_ids.append(tid)
+                cn_geometry = (float(meta.X12_m), float(meta.X13_m))
+
     if scheme == "rw" and len(regular_results) >= 2:
         out = _ensure_run_dir()
         csv_path = _write_kr_vs_freq(
@@ -411,6 +569,44 @@ def _run(args) -> None:
             window_mode=args.window_mode,
         )
         print(f"[run_analysis] wrote {html_path}")
+
+    if args.cn_fit:
+        if not cn_records or cn_geometry is None:
+            print(
+                "[run_analysis] --cn-fit: no usable records collected.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        X12, X13 = cn_geometry
+        try:
+            cn_dict = fit_cn_from_records(cn_records, X12=X12, X13=X13)
+        except Exception as exc:
+            print(f"[run_analysis] --cn-fit failed: {exc}", file=sys.stderr)
+            sys.exit(1)
+        fit_meta = {
+            "fitted_from_test_ids": cn_test_ids,
+            "fitted_from_window_mode": args.window_mode,
+            "fitted_with_recalibrate": bool(args.recalibrate),
+            "fit_mask": {
+                "harmonic_halfwidth_Hz": 0.02,
+                "delta_l_over_L_lo": 0.05,
+                "delta_l_over_L_hi": 0.45,
+            },
+            "geometry": {"X12_m": X12, "X13_m": X13},
+            "n_records": len(cn_records),
+        }
+        save_cn_config(cn_config_path, cn_dict, fit_meta=fit_meta)
+        print(f"[run_analysis] wrote {cn_config_path}")
+        for key in ("wp2", "wp3"):
+            entry = cn_dict[key]
+            d = entry.get("fit_diagnostics", {})
+            print(
+                f"  [cn_fit] {key} α={entry['alpha']:.4f} "
+                f"Δx={entry['delta_x_m']*1000:+.2f} mm "
+                f"Δt={entry['delta_t_s']*1e6:+.1f} µs "
+                f"(n_bins={d.get('n_bins_used', '?')}, "
+                f"residual={d.get('residual_rms_rad', float('nan')):.3f} rad)"
+            )
 
 
 def _report(result: RegularResult | IrregularResult) -> None:

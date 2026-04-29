@@ -43,10 +43,13 @@ DEFAULT_TANK_CONFIG = _PKG_ROOT / "experiment_data" / "tank_config.json"
 DEFAULT_METADATA_DIR = _PKG_ROOT / "experiment_data" / "metadata"
 DEFAULT_DATA_DIR = _PKG_ROOT / "experiment_data"
 DEFAULT_PROBES_CONFIG = _PKG_ROOT / "experiment_data" / "probes.json"
+DEFAULT_CN_CONFIG = _PKG_ROOT / "experiment_data" / "probes_refined.json"
 
 USER_CONFIG_PATH = _PKG_ROOT / ".reflection_coefficient.json"
 
-_PATH_KEYS = ("tank_config", "metadata_dir", "data_dir", "probes_config")
+_PATH_KEYS = (
+    "tank_config", "metadata_dir", "data_dir", "probes_config", "cn_config",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -75,11 +78,13 @@ def save_paths(
     metadata_dir: Path | str | None = None,
     data_dir: Path | str | None = None,
     probes_config: Path | str | None = None,
+    cn_config: Path | str | None = None,
 ) -> None:
-    """Persist any of the four paths the user provided. ``None`` = leave alone."""
+    """Persist any of the five paths the user provided. ``None`` = leave alone."""
     cfg = _load_user_config()
     for key, value in zip(
-        _PATH_KEYS, (tank_config, metadata_dir, data_dir, probes_config)
+        _PATH_KEYS,
+        (tank_config, metadata_dir, data_dir, probes_config, cn_config),
     ):
         if value is not None:
             cfg[key] = str(Path(value).resolve())
@@ -207,6 +212,11 @@ def resolve_probes_config(explicit: Path | str | None = None) -> Path:
     return _resolve("probes_config", explicit, DEFAULT_PROBES_CONFIG)
 
 
+def resolve_cn_config(explicit: Path | str | None = None) -> Path:
+    """Path to ``probes_refined.json`` (per-probe complex correction $C_n$)."""
+    return _resolve("cn_config", explicit, DEFAULT_CN_CONFIG)
+
+
 def save_recalibrate(flag: bool) -> None:
     """Persist the on/off state of the linear probe re-calibration."""
     cfg = _load_user_config()
@@ -219,6 +229,34 @@ def resolve_recalibrate(explicit: bool | None, default: bool = True) -> bool:
     if explicit is not None:
         return bool(explicit)
     return bool(_load_user_config().get("recalibrate", default))
+
+
+def save_cn_apply(flag: bool) -> None:
+    """Persist the on/off state of the per-probe complex correction $C_n$."""
+    cfg = _load_user_config()
+    cfg["cn_apply"] = bool(flag)
+    _save_user_config(cfg)
+
+
+def resolve_cn_apply(explicit: bool | None, default: bool = False) -> bool:
+    """Resolve the $C_n$-apply flag. Defaults to **off** (opt-in) — a stale fit
+    silently corrupting separation is worse than a missing correction."""
+    if explicit is not None:
+        return bool(explicit)
+    return bool(_load_user_config().get("cn_apply", default))
+
+
+def save_cn_mode(mode: str) -> None:
+    """Persist the $C_n$ mode (amp / phase / both)."""
+    cfg = _load_user_config()
+    cfg["cn_mode"] = mode
+    _save_user_config(cfg)
+
+
+def resolve_cn_mode(explicit: str | None, default: str = "both") -> str:
+    if explicit is not None:
+        return explicit
+    return _load_user_config().get("cn_mode", default)
 
 
 # ---------------------------------------------------------------------------
