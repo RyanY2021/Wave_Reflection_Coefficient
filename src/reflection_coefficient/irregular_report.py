@@ -234,92 +234,84 @@ def _spectra_canvas(result: IrregularResult, win: dict) -> str:
     return _chart_wrap("spectraChart", 380, script)
 
 
-def _kr_f_canvas(result: IrregularResult, win: dict) -> str:
-    f = _to_list(result.f_smooth)
+def _kr_and_singularity_canvas(result: IrregularResult, meta: TestMeta,
+                                method: str, win: dict) -> str:
+    """Dual-axis chart: K_r(f) on the left axis, singularity metric on the right."""
+    f_kr = _to_list(result.f_smooth)
     kr = _to_list(result.Kr_f)
-    pad = 0.1 * (win["f_hi"] - win["f_lo"])
-    x_min = max(0.0, win["f_lo"] - pad)
-    x_max = win["f_hi"] + pad
-    script = f"""(function(){{
-  const f = {json.dumps(f)}, kr = {json.dumps(kr)};
-  const pts = f.map((x,i)=>({{x, y:kr[i]}})).filter(p=>p.y!=null);
-  const overall = {result.Kr_overall if np.isfinite(result.Kr_overall) else 'null'};
-  new Chart(document.getElementById('krfChart'), {{
-    type:'line',
-    data:{{datasets:[
-      {{label:'K_r(f)', data:pts, borderColor:'#0F6E56',
-        backgroundColor:'#0F6E56', pointRadius:2, pointHoverRadius:5,
-        tension:0.15, borderWidth:1.5}}
-    ]}},
-    options:{{
-      responsive:true, maintainAspectRatio:false,
-      plugins:{{
-        legend:{{labels:{{boxWidth:12}}}},
-        tooltip:{{callbacks:{{
-          title:(items)=>'f = '+items[0].parsed.x.toFixed(3)+' Hz',
-          label:(ctx)=>'K_r = '+ctx.parsed.y.toFixed(3)
-        }}}}
-      }},
-      scales:{{
-        x:{{type:'linear', min:{x_min}, max:{x_max}, title:{{display:true,text:'f (Hz)'}}}},
-        y:{{title:{{display:true,text:'K_r(f)'}}, beginAtZero:true}}
-      }}
-    }},
-    plugins:[bandPlugin({win['f_lo']}, {win['f_hi']}, {win['f_peak']}),
-            hLinePlugin(overall, '#A32D2D', 'K_r overall = '+(overall==null?'—':overall.toFixed(3)))]
-  }});
-}})();"""
-    return _chart_wrap("krfChart", 380, script)
 
-
-def _singularity_canvas(result: IrregularResult, meta: TestMeta,
-                        method: str, win: dict) -> str:
-    f = np.asarray(result.f)
-    k = solve_dispersion_array(f, meta.water_depth_m, g=meta.gravity_m_s2)
+    f_sing = np.asarray(result.f)
+    k = solve_dispersion_array(f_sing, meta.water_depth_m, g=meta.gravity_m_s2)
     if method == "goda":
         metric = np.sin(k * meta.X13_m) ** 2
         threshold = 0.05
-        y_label = "sin²(k·X13)  (Goda)"
+        sing_label = "sin²(k·X13)  (Goda)"
     else:
         sb = np.sin(k * meta.X12_m)
         sg = np.sin(k * meta.X13_m)
         sgb = np.sin(k * meta.X13_m - k * meta.X12_m)
         metric = 2.0 * (sb * sb + sg * sg + sgb * sgb)
         threshold = 0.1
-        y_label = "D  (Mansard–Funke)"
+        sing_label = "D  (Mansard–Funke)"
+
     pad = 0.1 * (win["f_hi"] - win["f_lo"])
     x_min = max(0.0, win["f_lo"] - pad)
     x_max = win["f_hi"] + pad
-    f_list = _to_list(f)
+    f_sing_list = _to_list(f_sing)
     m_list = _to_list(metric)
+    overall_js = result.Kr_overall if np.isfinite(result.Kr_overall) else 'null'
     script = f"""(function(){{
-  const f = {json.dumps(f_list)}, m = {json.dumps(m_list)};
-  const pts = f.map((x,i)=>({{x, y:m[i]}})).filter(p=>p.y!=null);
-  new Chart(document.getElementById('singChart'), {{
+  const fk = {json.dumps(f_kr)}, kr = {json.dumps(kr)};
+  const fs = {json.dumps(f_sing_list)}, ms = {json.dumps(m_list)};
+  const ptsKr   = fk.map((x,i)=>({{x, y:kr[i]}})).filter(p=>p.y!=null);
+  const ptsSing = fs.map((x,i)=>({{x, y:ms[i]}})).filter(p=>p.y!=null);
+  const overall = {overall_js};
+  new Chart(document.getElementById('krSingChart'), {{
     type:'line',
     data:{{datasets:[
-      {{label:{json.dumps(y_label)}, data:pts, borderColor:'#5f5e5a',
-        backgroundColor:'#5f5e5a', pointRadius:0, borderWidth:1.2, tension:0.1}}
+      {{label:'K_r(f)', data:ptsKr, borderColor:'#0F6E56',
+        backgroundColor:'#0F6E56', pointRadius:2, pointHoverRadius:5,
+        tension:0.15, borderWidth:1.5, yAxisID:'yKr'}},
+      {{label:{json.dumps(sing_label)}, data:ptsSing, borderColor:'#5f5e5a',
+        backgroundColor:'#5f5e5a', pointRadius:0, borderWidth:1.2, borderDash:[4,3],
+        tension:0.1, yAxisID:'ySing'}}
     ]}},
     options:{{
       responsive:true, maintainAspectRatio:false,
+      interaction:{{mode:'x', intersect:false}},
       plugins:{{
         legend:{{labels:{{boxWidth:12}}}},
-        tooltip:{{callbacks:{{
-          title:(items)=>'f = '+items[0].parsed.x.toFixed(3)+' Hz',
-          label:(ctx)=>ctx.dataset.label+' = '+ctx.parsed.y.toFixed(4)
-        }}}}
+        tooltip:{{
+          mode:'x', intersect:false,
+          filter:(ctx, idx, arr)=>arr.findIndex(i=>i.datasetIndex===ctx.datasetIndex)===idx,
+          callbacks:{{
+            title:(items)=>'f = '+items[0].parsed.x.toFixed(3)+' Hz',
+            label:(ctx)=>{{
+              if(ctx.dataset.yAxisID==='yKr') return 'K_r = '+ctx.parsed.y.toFixed(3);
+              return ctx.dataset.label+' = '+ctx.parsed.y.toFixed(4);
+            }}
+          }}
+        }}
       }},
       scales:{{
         x:{{type:'linear', min:{x_min}, max:{x_max}, title:{{display:true,text:'f (Hz)'}}}},
-        y:{{title:{{display:true,text:{json.dumps(y_label)}}}, beginAtZero:true}}
+        yKr:{{type:'linear', position:'left',
+              title:{{display:true,text:'K_r(f)',color:'#0F6E56'}},
+              ticks:{{color:'#0F6E56'}}, beginAtZero:true}},
+        ySing:{{type:'linear', position:'right',
+                title:{{display:true,text:{json.dumps(sing_label)},color:'#5f5e5a'}},
+                ticks:{{color:'#5f5e5a'}}, beginAtZero:true,
+                grid:{{drawOnChartArea:false}}}}
       }}
     }},
     plugins:[bandPlugin({win['f_lo']}, {win['f_hi']}, {win['f_peak']}),
-            hLinePlugin({threshold}, '#A32D2D', 'threshold = {threshold}')]
+            hLinePlugin(overall, '#A32D2D',
+                        'K_r overall = '+(overall==null?'—':overall.toFixed(3)), 'yKr'),
+            hLinePlugin({threshold}, '#A32D2D',
+                        'singularity threshold = {threshold}', 'ySing')]
   }});
 }})();"""
-    return _chart_wrap("singChart", 320, script)
+    return _chart_wrap("krSingChart", 420, script)
 
 
 _CHART_PLUGINS = r"""
@@ -348,12 +340,14 @@ function bandPlugin(fLo, fHi, fPeak){
     }
   };
 }
-function hLinePlugin(y, color, label){
+function hLinePlugin(y, color, label, axisID){
   return {
-    id:'hline'+y+color,
+    id:'hline'+y+color+(axisID||''),
     afterDraw(chart){
       if(y==null) return;
-      const ctx = chart.ctx, yS = chart.scales.y, area = chart.chartArea;
+      const ctx = chart.ctx, area = chart.chartArea;
+      const yS = chart.scales[axisID || 'y'];
+      if(!yS) return;
       const yp = yS.getPixelForValue(y);
       if(yp < area.top || yp > area.bottom) return;
       ctx.save();
@@ -448,6 +442,12 @@ def write_irregular_report(
             f'<p style="color:var(--color-text-secondary);margin-bottom:1rem;">'
             f'Generated {html.escape(timestamp)}</p>'
         )
+    if getattr(result, "cn_applied", False):
+        header += (
+            f'<p style="color:var(--color-text-secondary);margin-bottom:1rem;'
+            f'font-style:italic;">Per-probe complex correction C<sub>n</sub> '
+            f'applied (mode: {html.escape(result.cn_mode)}).</p>'
+        )
 
     layout_block = (
         '<div style="background:var(--color-background-secondary);'
@@ -468,10 +468,8 @@ def write_irregular_report(
         _window_timeline_canvas(win),
         "<h2>Incident & reflected spectra</h2>",
         _spectra_canvas(result, win),
-        "<h2>K<sub>r</sub>(f)</h2>",
-        _kr_f_canvas(result, win),
-        "<h2>Singularity metric</h2>",
-        _singularity_canvas(result, meta, method, win),
+        "<h2>K<sub>r</sub>(f) & singularity metric</h2>",
+        _kr_and_singularity_canvas(result, meta, method, win),
     ])
 
     html_doc = (

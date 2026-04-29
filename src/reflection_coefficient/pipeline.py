@@ -26,6 +26,7 @@ from .analysis import (
     solve_dispersion,
     solve_dispersion_array,
 )
+from .cn_correction import apply_cn_to_bins
 from .io import TestMeta
 from .methods.goda import goda_separation
 from .methods.least_squares import mansard_funke_separation
@@ -133,6 +134,8 @@ class RegularResult:
     freq_source: str = "bin"
     f_target_Hz: float = 0.0
     goda_pair: str = "13"
+    cn_applied: bool = False
+    cn_mode: str = "both"
 
 
 @dataclass
@@ -152,6 +155,8 @@ class IrregularResult:
     Tp_I: float
     band_mask: np.ndarray         # indices of bins used for the overall Kr
     diagnostics: dict = field(default_factory=dict)
+    cn_applied: bool = False
+    cn_mode: str = "both"
 
 
 # ---------------------------------------------------------------------------
@@ -171,6 +176,8 @@ def analyse_regular(
     window_mode: WindowMode = "canonical",
     freq_source: FreqSource = "bin",
     goda_pair: GodaPair = "13",
+    cn_config: dict | None = None,
+    cn_mode: str = "both",
 ) -> RegularResult:
     if meta.f_Hz is None:
         raise ValueError(f"{meta.test_id}: regular-wave analysis requires meta.f_Hz")
@@ -267,6 +274,18 @@ def analyse_regular(
     else:
         raise ValueError(f"Unknown freq_source {freq_source!r}")
 
+    # Per-probe complex correction C_n(f), if configured. Operates on the raw
+    # FFT bins before either separation method consumes them; B1 is left alone
+    # because probe 1 is the reference (C_1 ≡ 1).
+    if cn_config is not None:
+        f_arr = np.array([f_used])
+        k_arr_cn = np.array([k_val])
+        b1_arr, b2_arr, b3_arr = apply_cn_to_bins(
+            np.array([b1]), np.array([b2]), np.array([b3]),
+            f_arr, k_arr_cn, cn_config, mode=cn_mode,
+        )
+        b1, b2, b3 = complex(b1_arr[0]), complex(b2_arr[0]), complex(b3_arr[0])
+
     if method == "goda":
         k_arr = np.array([k_val])
         # Pick which two probes to feed Goda. Convention: first argument is the
@@ -323,7 +342,107 @@ def analyse_regular(
         freq_source=freq_source,
         f_target_Hz=f_target,
         goda_pair=goda_pair,
+        cn_applied=cn_config is not None,
+        cn_mode=cn_mode,
     )
+
+
+def extract_regular_bins(
+    t: np.ndarray,
+    eta1: np.ndarray,
+    eta2: np.ndarray,
+    eta3: np.ndarray,
+    meta: TestMeta,
+    *,
+    head_drop_s: float = 0.0,
+    tail_drop_s: float = 0.0,
+    window_mode: WindowMode = "noref",
+    freq_source: FreqSource = "bin",
+) -> tuple[float, float, complex, complex, complex]:
+    """Return ``(f_used, k_val, b1, b2, b3)`` for one regular-wave record.
+
+    Mirrors the bin-extraction stage of :func:`analyse_regular` without running
+    the separation. Used by the ``--cn-fit`` branch in ``run_analysis.py`` to
+    aggregate per-test FFT bins from a noref window before fitting $C_n$.
+    Bins are returned **uncorrected** — apply $C_n$ at the consumer if needed.
+    """
+    if meta.f_Hz is None:
+        raise ValueError(
+            f"{meta.test_id}: extract_regular_bins requires meta.f_Hz"
+        )
+    x_paddle, x_struct, X12, X13 = _require_geometry(meta)
+    depth = meta.water_depth_m
+    g = meta.gravity_m_s2
+
+    cg = group_velocity(meta.f_Hz, depth, g=g)
+    if window_mode == "canonical":
+        t_start, t_end_physics = clip_bounds(cg, x_paddle, x_struct, X13)
+    elif window_mode == "noref":
+        t_start, t_end_physics = _noref_bounds(cg, x_paddle, x_struct, X13)
+    else:
+        raise ValueError(f"Unknown window_mode {window_mode!r}")
+
+    record_tail = float(t[-1])
+    if meta.t_gen_s is not None:
+        runtime_bound = min(record_tail, float(meta.t_gen_s) + x_paddle / cg)
+    else:
+        runtime_bound = record_tail
+    t_end = min(t_end_physics, runtime_bound)
+    if t_end <= t_start:
+        raise ValueError(
+            f"{meta.test_id}: clip window collapses "
+            f"(t_start={t_start:.2f} s, t_end={t_end:.2f} s)."
+        )
+
+    head_drop_s = max(float(head_drop_s), 0.0)
+    tail_drop_s = max(float(tail_drop_s), 0.0)
+    t_ana_start = t_start + head_drop_s
+    t_ana_end = t_end - tail_drop_s
+    if t_ana_end <= t_ana_start:
+        raise ValueError(
+            f"{meta.test_id}: head/tail drops collapse the analysis window."
+        )
+
+    t_c, e1, e2, e3 = clip_window(
+        t, eta1, eta2, eta3, t_start=t_ana_start, t_end=t_ana_end
+    )
+    if t_c.size < 8:
+        raise ValueError(
+            f"{meta.test_id}: clip window contains only {t_c.size} samples"
+        )
+    e1, e2, e3 = remove_mean(e1), remove_mean(e2), remove_mean(e3)
+
+    fs = 1.0 / np.mean(np.diff(t_c))
+    N = e1.size
+    k_val, _ = solve_dispersion(meta.f_Hz, depth, g=g)
+    f_target = float(meta.f_Hz)
+
+    if freq_source == "bin":
+        freqs, B1 = positive_fft(e1, fs)
+        _, B2 = positive_fft(e2, fs)
+        _, B3 = positive_fft(e3, fs)
+        df = fs / N
+        k_bin = int(round(f_target / df))
+        if not (1 <= k_bin < freqs.size):
+            raise ValueError(
+                f"{meta.test_id}: target f={f_target} Hz outside FFT range"
+            )
+        b1, b2, b3 = B1[k_bin], B2[k_bin], B3[k_bin]
+        f_used = float(freqs[k_bin])
+    elif freq_source == "target":
+        if not (0.0 < f_target < 0.5 * fs):
+            raise ValueError(
+                f"{meta.test_id}: target f={f_target} Hz outside (0, fs/2)"
+            )
+        phasor = np.exp(-1j * 2.0 * np.pi * f_target * np.arange(N) / fs)
+        b1 = complex(np.sum(e1 * phasor))
+        b2 = complex(np.sum(e2 * phasor))
+        b3 = complex(np.sum(e3 * phasor))
+        f_used = f_target
+    else:
+        raise ValueError(f"Unknown freq_source {freq_source!r}")
+
+    return f_used, float(k_val), complex(b1), complex(b2), complex(b3)
 
 
 # ---------------------------------------------------------------------------
@@ -354,6 +473,8 @@ def analyse_irregular(
     tail_drop_s: float = 0.0,
     window_mode: WindowMode = "canonical",
     goda_pair: GodaPair = "13",
+    cn_config: dict | None = None,
+    cn_mode: str = "both",
 ) -> IrregularResult:
     """Irregular-wave reflection analysis (white-noise or JONSWAP).
 
@@ -484,6 +605,13 @@ def analyse_irregular(
     B1, B2, B3 = B1[1:], B2[1:], B3[1:]
     k_arr = solve_dispersion_array(f_pos, depth, g=g)
 
+    # Per-probe complex correction C_n(f), if configured. Vectorised across
+    # all bins; B1 is unchanged (probe 1 reference, C_1 ≡ 1).
+    if cn_config is not None:
+        B1, B2, B3 = apply_cn_to_bins(
+            B1, B2, B3, f_pos, k_arr, cn_config, mode=cn_mode,
+        )
+
     if method == "goda":
         if goda_pair == "13":
             Bn, Bf = B1, B3
@@ -565,6 +693,8 @@ def analyse_irregular(
         "bandwidth_Hz": float(bandwidth_effective),
         "window_mode": window_mode,
         "goda_pair": goda_pair if method == "goda" else None,
+        "cn_applied": cn_config is not None,
+        "cn_mode": cn_mode,
     }
 
     return IrregularResult(
@@ -583,6 +713,8 @@ def analyse_irregular(
         Tp_I=Tp_I,
         band_mask=band,
         diagnostics=diagnostics,
+        cn_applied=cn_config is not None,
+        cn_mode=cn_mode,
     )
 
 
@@ -600,11 +732,15 @@ def analyse(
     window_mode: WindowMode = "canonical",
     freq_source: FreqSource = "bin",
     goda_pair: GodaPair = "13",
+    cn_config: dict | None = None,
+    cn_mode: str = "both",
 ) -> RegularResult | IrregularResult:
     """Dispatch to the regular or irregular path based on ``meta.campaign``.
 
     ``freq_source`` is a regular-wave-only switch; ignored for wn/js.
     ``goda_pair`` only takes effect when ``method == "goda"``.
+    ``cn_config`` (if not None) divides the FFT bins by per-probe $C_n(f)$
+    before separation; ``cn_mode`` selects amp / phase / both.
     """
     if meta.campaign == "rw":
         return analyse_regular(
@@ -613,6 +749,8 @@ def analyse(
             window_mode=window_mode,
             freq_source=freq_source,
             goda_pair=goda_pair,
+            cn_config=cn_config,
+            cn_mode=cn_mode,
         )
     return analyse_irregular(
         t, eta1, eta2, eta3, meta, method=method,
@@ -620,4 +758,6 @@ def analyse(
         head_drop_s=head_drop_s, tail_drop_s=tail_drop_s,
         window_mode=window_mode,
         goda_pair=goda_pair,
+        cn_config=cn_config,
+        cn_mode=cn_mode,
     )
