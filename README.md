@@ -115,8 +115,9 @@ Path inputs and analysis choices are **persisted per-user** in
 | `--tail-drop SEC` | default: `3.0` | ✔ | Seconds to trim from the **end** of the clean analysis window, so the FFT skips ramp-down transients. |
 | `--recalibrate` / `--no-recalibrate` | default: on | ✔ | Apply the per-probe linear re-calibration from `probes.json` after loading. Use `--no-recalibrate` to disable. See [Linear probe re-calibration](#linear-probe-re-calibration). |
 | `--window-mode {canonical,noref}` | default: `canonical` | — | Clip-window selection. `canonical` uses the full reflection-inclusive travel-time window from `docs/reflection_processing_pipeline.md` §2.1; `noref` uses a pre-reflection window ending before the first reflected front returns to probe 1, for a baseline sanity check where the true `Kr` should be zero. Explicit diagnostic — not persisted. Outputs gain a `_noref` filename suffix. |
-| `--freq-source {bin,target}` | default: `bin` | ✔ | Regular-wave only. `bin` uses the nearest FFT bin to `meta.f_Hz` (fastest, bin-quantised); `target` evaluates the DFT at exactly the target frequency from metadata via a single-point `Σ x[n]·exp(-i·2π·f·n/fs)`, eliminating bin-quantisation error. Ignored for `wn` / `js`. |
+| `--freq-source {bin,target}` | default: `target` | ✔ | Regular-wave only. `target` (default) evaluates the DFT at exactly the target frequency from metadata via a single-point `Σ x[n]·exp(-i·2π·f·n/fs)`, eliminating bin-quantisation error — relies on the wave maker holding the commanded frequency exactly across the test. `bin` snaps to the nearest FFT bin (fastest, bin-quantised). Ignored for `wn` / `js`. |
 | `--goda-pair {13,12,23}` | default: `13` | ✔ | Goda-only. Which two probes feed the two-probe separation: `13` = wp1 + wp3 (widest spacing, default), `12` = wp1 + wp2, `23` = wp2 + wp3 (spacing `X13 − X12`). Changing Δ moves the `kΔ = nπ` singularities in frequency — useful when the default pair sits on a near-singular bin for a given test. Ignored when `--method least_squares`. |
+| `--cn-alpha-mode {scalar,dynamic}` | default: `dynamic` | ✔ | How $\alpha$ is evaluated when applying $C_n$. `dynamic` linearly interpolates the per-bin $\alpha$ table stored in `probes_refined.json` (`per_bin.alpha`) over frequency, with the scalar masked-mean $\alpha$ as fallback for bins outside the table's $f$-range. `scalar` uses the masked-mean $\alpha$ at every frequency. The scalar's frequency mask is editable in `probes_refined.json` under `fit_mask` (`f_min_Hz`, `f_max_Hz`); user edits survive a re-fit. Ignored when `--cn-apply` is off or `--cn-mode phase`. See `docs/cn_fit_formulas.md` §2. |
 | `--output PATH` | default: `<project>/results` | — | Parent output dir. A timestamped subfolder `YYYYMMDD_HHMMSS/` is created per run. |
 | `--list` | flag | — | List discoverable tests for the chosen scheme and exit. |
 | `--show-paths` | flag | — | Print the resolved `tank_config` / `metadata_dir` / `data_dir` / `probes_config` / `method` / `window` / `bandwidth` / drops / `freq_source` / `goda_pair` and exit. |
@@ -156,9 +157,10 @@ python scripts/run_analysis.py --scheme rw --test all --recalibrate
 # Outputs gain a `_noref` filename suffix so they don't clobber the normal run.
 python scripts/run_analysis.py --scheme rw --test all --window-mode noref
 
-# Evaluate the regular-wave DFT at exactly meta.f_Hz (no FFT bin snapping).
-# Persisted — subsequent rw runs keep using target-freq unless --freq-source bin.
-python scripts/run_analysis.py --scheme rw --test RW005 --freq-source target
+# --freq-source target is now the default — evaluates the DFT at exactly
+# meta.f_Hz (no FFT bin snapping). Use --freq-source bin to fall back to the
+# nearest-bin behaviour for diagnostic comparison; the choice is persisted.
+python scripts/run_analysis.py --scheme rw --test RW005 --freq-source bin
 
 # Swap the Goda probe pair when the default (wp1 & wp3) sits on a singularity.
 # Persisted; ignored when --method least_squares.

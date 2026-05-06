@@ -212,10 +212,17 @@ Persisted per-user choices (stored in `~/.reflection_coefficient.json` alongside
 the three paths): `--method` (goda / least_squares, default least_squares),
 `--window` (none / hann, default hann), `--bandwidth` (Hz, default 0.04),
 `--head-drop` and `--tail-drop` (seconds trimmed from the start/end of the
-travel-time clip to skip ramp transients, default 3.0 s each), and
-`--freq-source` (regular-wave only, bin / target, default bin; `target`
-evaluates a single-point DFT at exactly `meta.f_Hz` instead of snapping to
-the nearest FFT bin).
+travel-time clip to skip ramp transients, default 3.0 s each),
+`--freq-source` (regular-wave only, bin / target, **default target**;
+`target` evaluates a single-point DFT at exactly `meta.f_Hz` instead of
+snapping to the nearest FFT bin — assumes the wave maker holds the
+commanded frequency exactly across the test, which is true on this rig),
+and `--cn-alpha-mode` (scalar / dynamic, **default dynamic**; `dynamic`
+linearly interpolates the per-bin $\alpha(f)$ table from `probes_refined.json`
+with the masked-mean scalar $\alpha$ as fallback outside the table's
+frequency range; `scalar` uses the masked-mean $\alpha$ everywhere. The
+scalar's frequency mask is editable under `fit_mask` in `probes_refined.json`
+and survives a re-fit. See `docs/cn_fit_formulas.md` §2).
 
 `--window-mode` (canonical / noref) is **not** persisted — it is intended
 as an explicit diagnostic mode (pre-reflection baseline check where Kr

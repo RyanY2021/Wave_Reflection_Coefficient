@@ -111,7 +111,7 @@ def save_freq_source(freq_source: str) -> None:
     _save_user_config(cfg)
 
 
-def resolve_freq_source(explicit: str | None, default: str = "bin") -> str:
+def resolve_freq_source(explicit: str | None, default: str = "target") -> str:
     if explicit is not None:
         return explicit
     return _load_user_config().get("freq_source", default)
@@ -257,6 +257,19 @@ def resolve_cn_mode(explicit: str | None, default: str = "both") -> str:
     if explicit is not None:
         return explicit
     return _load_user_config().get("cn_mode", default)
+
+
+def save_cn_alpha_mode(mode: str) -> None:
+    """Persist the $C_n$ α-evaluation mode (scalar / dynamic)."""
+    cfg = _load_user_config()
+    cfg["cn_alpha_mode"] = mode
+    _save_user_config(cfg)
+
+
+def resolve_cn_alpha_mode(explicit: str | None, default: str = "dynamic") -> str:
+    if explicit is not None:
+        return explicit
+    return _load_user_config().get("cn_alpha_mode", default)
 
 
 # ---------------------------------------------------------------------------

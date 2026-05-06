@@ -34,9 +34,17 @@ from typing import Iterable, Literal
 import numpy as np
 
 CnMode = Literal["amp", "phase", "both"]
+CnAlphaMode = Literal["scalar", "dynamic"]
 _PROBE_KEYS: tuple[str, ...] = ("wp1", "wp2", "wp3")
 _FFT_SIGN_TAG = "numpy_minus_iwt"
 _REFERENCE_PROBE = "wp1"
+_FIT_MASK_DOC = (
+    "Frequency range used when computing the scalar alpha (the fallback "
+    "for bins outside per_bin's frequency support, and the only alpha "
+    "consulted in --cn-alpha-mode scalar). Edit f_min_Hz / f_max_Hz to "
+    "narrow the band; null = no bound. The per_bin table itself is built "
+    "from every bin and is unaffected by this mask."
+)
 
 
 # ---------------------------------------------------------------------------
@@ -56,67 +64,70 @@ def measured_C(
     return np.asarray(Bn) / predicted_bins(B1, k, dx_nominal)
 
 
+def _eval_alpha(
+    f_arr: np.ndarray,
+    alpha_scalar: float,
+    alpha_mode: CnAlphaMode,
+    alpha_table: dict | None,
+) -> np.ndarray:
+    """Return $\\alpha(f)$ as an array of the same shape as ``f_arr``.
+
+    In ``scalar`` mode every element is ``alpha_scalar``. In ``dynamic`` mode,
+    in-range bins are linearly interpolated from ``alpha_table = {"f_Hz":
+    [...], "alpha": [...]}`` (assumed sorted ascending), and bins outside the
+    table's $[f_{\\min}, f_{\\max}]$ fall back to ``alpha_scalar``. If
+    ``alpha_table`` is missing or empty, dynamic silently degrades to scalar.
+    """
+    out = np.full_like(f_arr, float(alpha_scalar), dtype=float)
+    if alpha_mode != "dynamic" or alpha_table is None:
+        return out
+    f_table = np.asarray(alpha_table.get("f_Hz", []), dtype=float)
+    a_table = np.asarray(alpha_table.get("alpha", []), dtype=float)
+    if f_table.size == 0 or f_table.size != a_table.size:
+        return out
+    interp = np.interp(f_arr, f_table, a_table)
+    # Tolerance shields the in-range check against float roundoff at the
+    # boundary — the table's f comes from FFT-snapped or target-frequency
+    # quantisation, which can drift by a few ULPs from a hand-typed apply-f.
+    span = float(f_table[-1] - f_table[0]) if f_table.size > 1 else 1.0
+    tol = max(1e-9 * max(span, 1.0), 1e-12)
+    in_range = (f_arr >= f_table[0] - tol) & (f_arr <= f_table[-1] + tol)
+    return np.where(in_range, interp, float(alpha_scalar))
+
+
 def evaluate_C(
     f: np.ndarray, k: np.ndarray,
     alpha: float, delta_x: float, delta_t: float,
     mode: CnMode = "both",
+    *,
+    alpha_mode: CnAlphaMode = "scalar",
+    alpha_table: dict | None = None,
 ) -> np.ndarray:
-    """Evaluate the parametric $C_n(f) = \\alpha \\cdot e^{-i k \\Delta x - i \\omega \\Delta t}$.
+    """Evaluate the parametric $C_n(f) = \\alpha(f) \\cdot e^{-i k \\Delta x - i \\omega \\Delta t}$.
 
-    ``mode='amp'`` returns $\\alpha$ only (phase identity).
+    ``mode='amp'`` returns $\\alpha(f)$ only (phase identity).
     ``mode='phase'`` returns $e^{-i k \\Delta x - i \\omega \\Delta t}$ only ($\\alpha = 1$).
     ``mode='both'`` returns the full product.
+
+    ``alpha_mode='scalar'`` (default) uses the supplied ``alpha`` for every $f$;
+    ``alpha_mode='dynamic'`` interpolates ``alpha_table`` and falls back to the
+    scalar for $f$ outside the table's frequency support.
     """
     f_arr = np.asarray(f, dtype=float)
     k_arr = np.asarray(k, dtype=float)
     omega = 2.0 * np.pi * f_arr
+    alpha_arr = _eval_alpha(f_arr, float(alpha), alpha_mode, alpha_table)
     if mode == "amp":
-        out = np.full_like(omega, float(alpha), dtype=complex)
+        out = alpha_arr.astype(complex)
     elif mode == "phase":
         out = np.exp(-1j * (k_arr * float(delta_x) + omega * float(delta_t)))
     elif mode == "both":
-        out = float(alpha) * np.exp(
+        out = alpha_arr * np.exp(
             -1j * (k_arr * float(delta_x) + omega * float(delta_t))
         )
     else:
         raise ValueError(f"Unknown mode {mode!r}; expected 'amp', 'phase', or 'both'.")
     return out
-
-
-# ---------------------------------------------------------------------------
-# Bin-mask builder (paper-grounded constraints from issue #4)
-# ---------------------------------------------------------------------------
-
-
-def build_fit_mask(
-    f: np.ndarray,
-    k: np.ndarray,
-    X13: float,
-    *,
-    f_peak_Hz: float | None = None,
-    harmonic_halfwidth_Hz: float = 0.02,
-    delta_l_over_L_lo: float = 0.05,
-    delta_l_over_L_hi: float = 0.45,
-) -> np.ndarray:
-    """Boolean mask over bins, applying Goda-effective range and harmonic notches.
-
-    Bin retained when ``delta_l_over_L_lo < X13 / L < delta_l_over_L_hi`` (Goda
-    Eq 7 effective range, with $L = 2\\pi / k$). When ``f_peak_Hz`` is given,
-    bins within ``±harmonic_halfwidth_Hz`` of $2 f_p$ and $3 f_p$ are also
-    excluded — nonlinear harmonics travel at the fundamental celerity, so
-    linear $k(\\omega)$ is wrong there and would corrupt the phase fit.
-    """
-    f_arr = np.asarray(f, dtype=float)
-    k_arr = np.asarray(k, dtype=float)
-    delta_l_over_L = k_arr * float(X13) / (2.0 * np.pi)
-    mask = (delta_l_over_L > float(delta_l_over_L_lo)) & (
-        delta_l_over_L < float(delta_l_over_L_hi)
-    )
-    if f_peak_Hz is not None:
-        hw = float(harmonic_halfwidth_Hz)
-        for n in (2, 3):
-            mask &= np.abs(f_arr - n * float(f_peak_Hz)) > hw
-    return mask
 
 
 # ---------------------------------------------------------------------------
@@ -130,43 +141,63 @@ def fit_probe_cn_parametric(
     B1: np.ndarray,
     Bn: np.ndarray,
     dx_nominal: float,
-    fit_mask: np.ndarray,
+    *,
+    mask_f_min: float | None = None,
+    mask_f_max: float | None = None,
 ) -> dict:
     """Fit $(\\alpha, \\Delta x, \\Delta t)$ for probe $n$ from noref bins.
 
-    $\\alpha$ = arithmetic mean of $|C_n|$ over masked bins.
+    Two flavours of $\\alpha$ are produced from the same bin set:
+
+    * **Dynamic** $\\alpha_n(f_i) = |C_n^{\\text{obs}}(f_i)|$ — every bin, no
+      mask. Returned in ``per_bin`` (sorted by frequency); used by
+      ``evaluate_C`` in ``alpha_mode='dynamic'`` via linear interpolation.
+    * **Scalar** $\\alpha_n = \\langle |C_n^{\\text{obs}}| \\rangle$ — arithmetic
+      mean over bins inside ``[mask_f_min, mask_f_max]``; ``None`` on either
+      bound = no constraint that side. Returned as ``alpha``; used as the
+      out-of-range fallback for the dynamic mode and as the only $\\alpha$ in
+      ``alpha_mode='scalar'``.
+
     $(\\Delta x, \\Delta t)$ = least-squares fit of
-    $\\arg(C_n / \\alpha) = -(k \\Delta x + \\omega \\Delta t)$ across masked bins
-    after phase unwrapping.
+    $\\arg(C_n / \\alpha) = -(k \\Delta x + \\omega \\Delta t)$ across all bins
+    after phase unwrapping (mask is **not** applied to the phase regression —
+    LSQ benefits from every bin).
     """
     f_arr = np.asarray(f, dtype=float)
     k_arr = np.asarray(k, dtype=float)
-    mask = np.asarray(fit_mask, dtype=bool)
+    if f_arr.size == 0:
+        raise ValueError("fit_probe_cn_parametric: no bins supplied.")
+    omega = 2.0 * np.pi * f_arr
+    C = measured_C(B1, Bn, k_arr, dx_nominal)
+    abs_C = np.abs(C)
+
+    # Scalar α: masked mean. The mask narrows to a frequency band the user
+    # trusts (avoiding e.g. low-SNR edges or harmonics outside the rig's
+    # reliable range). Default = whole data range, i.e. no-op mask.
+    f_lo = float(mask_f_min) if mask_f_min is not None else float(np.min(f_arr))
+    f_hi = float(mask_f_max) if mask_f_max is not None else float(np.max(f_arr))
+    mask = (f_arr >= f_lo) & (f_arr <= f_hi)
     if not np.any(mask):
         raise ValueError(
-            "fit_probe_cn_parametric: no bins selected by fit_mask "
-            "(check Goda-effective range vs the available frequencies)."
+            "fit_probe_cn_parametric: scalar-alpha mask "
+            f"[{f_lo}, {f_hi}] Hz excludes every bin in fit data "
+            f"[{float(np.min(f_arr))}, {float(np.max(f_arr))}] Hz."
         )
-    C = measured_C(B1, Bn, k_arr, dx_nominal)
-    C_m = C[mask]
-    f_m = f_arr[mask]
-    k_m = k_arr[mask]
-    omega_m = 2.0 * np.pi * f_m
-
-    alpha = float(np.mean(np.abs(C_m)))
-    if alpha <= 0:
+    alpha = float(np.mean(abs_C[mask]))
+    if not np.isfinite(alpha) or alpha <= 0:
         raise ValueError(
-            "fit_probe_cn_parametric: mean |C_n| is non-positive "
-            f"({alpha:.3e}); fit cannot proceed."
+            "fit_probe_cn_parametric: masked mean |C_n| is non-positive or "
+            f"non-finite ({alpha!r}); fit cannot proceed."
         )
 
     # Sort by frequency before unwrapping so the unwrap follows a coherent phase
     # progression rather than the arbitrary record order.
-    order = np.argsort(f_m)
-    f_s = f_m[order]
-    k_s = k_m[order]
-    omega_s = omega_m[order]
-    C_s = C_m[order]
+    order = np.argsort(f_arr)
+    f_s = f_arr[order]
+    k_s = k_arr[order]
+    omega_s = omega[order]
+    C_s = C[order]
+    abs_C_s = abs_C[order]
     beta = np.unwrap(np.angle(C_s / alpha))
 
     # Solve [[k, omega]] @ [delta_x, delta_t] = -beta in least-squares sense.
@@ -186,11 +217,14 @@ def fit_probe_cn_parametric(
         "delta_t_s": delta_t,
         "fit_diagnostics": {
             "residual_rms_rad": residual_rms,
-            "n_bins_used": int(mask.sum()),
+            "n_bins_used": int(f_arr.size),
+            "n_bins_in_mask": int(np.count_nonzero(mask)),
+            "mask_f_min_Hz": f_lo,
+            "mask_f_max_Hz": f_hi,
         },
         "per_bin": {
             "f_Hz": [float(x) for x in f_s],
-            "alpha": [float(x) for x in np.abs(C_s)],
+            "alpha": [float(x) for x in abs_C_s],
             "beta_rad": [float(x) for x in beta],
         },
     }
@@ -200,57 +234,67 @@ def fit_cn_from_records(
     records: Iterable[dict],
     X12: float,
     X13: float,
+    *,
+    existing_fit_mask: dict | None = None,
 ) -> dict:
     """Aggregate-fit $C_n$ across one or more noref records.
 
     Each ``record`` is a dict with keys ``f`` (1-D float), ``k`` (1-D float),
-    ``B1``, ``B2``, ``B3`` (1-D complex) all the same length, and optional
-    ``f_peak_Hz`` for the harmonic notch.
+    ``B1``, ``B2``, ``B3`` (1-D complex) all the same length. Every bin in
+    every record is included in the aggregate fit — pre-filter records before
+    calling if you want to exclude harmonics, near-singular spacings, or
+    low-SNR bins.
 
-    Returns ``{wp1: {...identity...}, wp2: {...fit...}, wp3: {...fit...}}``
-    suitable for ``save_cn_config``. Probe 1 is the reference and gets identity
-    values. wp2 is fitted against $X_{12}$ as the nominal spacing; wp3 against
-    $X_{13}$.
+    ``existing_fit_mask`` (if given) carries ``f_min_Hz`` / ``f_max_Hz``
+    pulled from a prior ``probes_refined.json``. Those bounds are reused
+    verbatim so user edits to the JSON survive a re-fit. ``None`` keys (or
+    a missing block) default to the data range, i.e. a no-op mask.
+
+    Returns ``{wp1: {...identity...}, wp2: {...fit...}, wp3: {...fit...},
+    fit_mask: {...}}`` suitable for ``save_cn_config``. Probe 1 is the
+    reference and gets identity values. wp2 is fitted against $X_{12}$ as
+    the nominal spacing; wp3 against $X_{13}$.
     """
     rec_list = list(records)
     if not rec_list:
         raise ValueError("fit_cn_from_records: at least one record required.")
 
-    # Build the aggregated arrays per probe pair, applying each record's mask.
     f_acc: list[np.ndarray] = []
     k_acc: list[np.ndarray] = []
     B1_acc: list[np.ndarray] = []
     B2_acc: list[np.ndarray] = []
     B3_acc: list[np.ndarray] = []
     for rec in rec_list:
-        f_r = np.asarray(rec["f"], dtype=float)
-        k_r = np.asarray(rec["k"], dtype=float)
-        mask_r = build_fit_mask(
-            f_r, k_r, X13, f_peak_Hz=rec.get("f_peak_Hz"),
-        )
-        if not np.any(mask_r):
-            continue
-        f_acc.append(f_r[mask_r])
-        k_acc.append(k_r[mask_r])
-        B1_acc.append(np.asarray(rec["B1"])[mask_r])
-        B2_acc.append(np.asarray(rec["B2"])[mask_r])
-        B3_acc.append(np.asarray(rec["B3"])[mask_r])
-
-    if not f_acc:
-        raise ValueError(
-            "fit_cn_from_records: no bins survived the per-record fit masks "
-            "(every record's frequencies fall outside the Goda-effective range)."
-        )
+        f_acc.append(np.asarray(rec["f"], dtype=float))
+        k_acc.append(np.asarray(rec["k"], dtype=float))
+        B1_acc.append(np.asarray(rec["B1"]))
+        B2_acc.append(np.asarray(rec["B2"]))
+        B3_acc.append(np.asarray(rec["B3"]))
 
     f_all = np.concatenate(f_acc)
     k_all = np.concatenate(k_acc)
     B1_all = np.concatenate(B1_acc)
     B2_all = np.concatenate(B2_acc)
     B3_all = np.concatenate(B3_acc)
-    full_mask = np.ones_like(f_all, dtype=bool)
 
-    fit2 = fit_probe_cn_parametric(f_all, k_all, B1_all, B2_all, X12, full_mask)
-    fit3 = fit_probe_cn_parametric(f_all, k_all, B1_all, B3_all, X13, full_mask)
+    f_data_min = float(np.min(f_all))
+    f_data_max = float(np.max(f_all))
+    if existing_fit_mask:
+        m_min = existing_fit_mask.get("f_min_Hz")
+        m_max = existing_fit_mask.get("f_max_Hz")
+        f_lo = float(m_min) if m_min is not None else f_data_min
+        f_hi = float(m_max) if m_max is not None else f_data_max
+    else:
+        f_lo, f_hi = f_data_min, f_data_max
+
+    fit2 = fit_probe_cn_parametric(
+        f_all, k_all, B1_all, B2_all, X12,
+        mask_f_min=f_lo, mask_f_max=f_hi,
+    )
+    fit3 = fit_probe_cn_parametric(
+        f_all, k_all, B1_all, B3_all, X13,
+        mask_f_min=f_lo, mask_f_max=f_hi,
+    )
 
     return {
         "wp1": {
@@ -261,12 +305,31 @@ def fit_cn_from_records(
         },
         "wp2": fit2,
         "wp3": fit3,
+        "fit_mask": {"f_min_Hz": f_lo, "f_max_Hz": f_hi},
     }
 
 
 # ---------------------------------------------------------------------------
 # Apply
 # ---------------------------------------------------------------------------
+
+
+def _probe_alpha_table(probe_entry: dict) -> dict | None:
+    """Pull the dynamic-$\\alpha$ interpolation table from a probe JSON entry.
+
+    The table source is ``per_bin.{f_Hz, alpha}``: per-bin observed magnitudes
+    in fit-frequency order. Returns ``None`` when the entry is identity-only
+    (e.g. ``wp1``, or the placeholder written by ``init_project``), in which
+    case dynamic mode silently degrades to scalar.
+    """
+    pb = probe_entry.get("per_bin")
+    if not pb:
+        return None
+    f_table = pb.get("f_Hz")
+    a_table = pb.get("alpha")
+    if not f_table or not a_table or len(f_table) != len(a_table):
+        return None
+    return {"f_Hz": f_table, "alpha": a_table}
 
 
 def apply_cn_to_bins(
@@ -277,17 +340,31 @@ def apply_cn_to_bins(
     k: np.ndarray,
     cn_config: dict,
     mode: CnMode = "both",
+    *,
+    alpha_mode: CnAlphaMode = "scalar",
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Divide $B_2$, $B_3$ by $C_n(f)$ in place-safe fashion. $B_1$ unchanged.
 
     Works on scalar, 0-D, and 1-D inputs uniformly via NumPy broadcasting; the
     regular-wave path passes single-element arrays, the irregular path passes
     per-bin arrays.
+
+    ``alpha_mode='dynamic'`` uses each probe's ``per_bin`` table (linear
+    interpolation, scalar fallback outside the table's frequency support);
+    ``'scalar'`` uses the stored ``alpha`` everywhere.
     """
     p2 = cn_config.get("wp2", {})
     p3 = cn_config.get("wp3", {})
-    C2 = evaluate_C(f, k, p2["alpha"], p2["delta_x_m"], p2["delta_t_s"], mode=mode)
-    C3 = evaluate_C(f, k, p3["alpha"], p3["delta_x_m"], p3["delta_t_s"], mode=mode)
+    table2 = _probe_alpha_table(p2) if alpha_mode == "dynamic" else None
+    table3 = _probe_alpha_table(p3) if alpha_mode == "dynamic" else None
+    C2 = evaluate_C(
+        f, k, p2["alpha"], p2["delta_x_m"], p2["delta_t_s"], mode=mode,
+        alpha_mode=alpha_mode, alpha_table=table2,
+    )
+    C3 = evaluate_C(
+        f, k, p3["alpha"], p3["delta_x_m"], p3["delta_t_s"], mode=mode,
+        alpha_mode=alpha_mode, alpha_table=table3,
+    )
     return np.asarray(B1), np.asarray(B2) / C2, np.asarray(B3) / C3
 
 
@@ -330,6 +407,10 @@ def save_cn_config(
         "fit_date_utc",
         datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
     )
+    if "fit_mask" in cn_dict:
+        fm = dict(cn_dict["fit_mask"])
+        fm.setdefault("_doc", _FIT_MASK_DOC)
+        out["fit_mask"] = fm
     for key in _PROBE_KEYS:
         if key in cn_dict:
             out[key] = cn_dict[key]

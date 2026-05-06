@@ -18,7 +18,6 @@ from reflection_coefficient.analysis import (
 )
 from reflection_coefficient.cn_correction import (
     apply_cn_to_bins,
-    build_fit_mask,
     evaluate_C,
     fit_cn_from_records,
     fit_probe_cn_parametric,
@@ -82,7 +81,6 @@ def _record_one_freq(
         "B1": np.array([B1[k_bin]]),
         "B2": np.array([B2[k_bin]]),
         "B3": np.array([B3[k_bin]]),
-        "f_peak_Hz": f,
     }
 
 
@@ -311,7 +309,6 @@ def test_idempotence():
         corrected.append({
             "f": rec["f"], "k": rec["k"],
             "B1": B1c, "B2": B2c, "B3": B3c,
-            "f_peak_Hz": rec.get("f_peak_Hz"),
         })
 
     second = fit_cn_from_records(corrected, X12=X12, X13=X13)
@@ -322,45 +319,7 @@ def test_idempotence():
 
 
 # ---------------------------------------------------------------------------
-# 6. Fit-mask: harmonic notches
-# ---------------------------------------------------------------------------
-
-
-def test_fit_mask_excludes_harmonics():
-    f = np.linspace(0.1, 2.0, 191)
-    k = solve_dispersion_array(f, depth=2.0)
-    mask = build_fit_mask(
-        f, k, X13=1.07,
-        f_peak_Hz=0.5, harmonic_halfwidth_Hz=0.02,
-        delta_l_over_L_lo=0.0, delta_l_over_L_hi=10.0,  # disable range filter
-    )
-    # Bins inside [0.98, 1.02] (2*f_p ± 0.02) should be masked out.
-    in_2f = (f > 0.98) & (f < 1.02)
-    assert not np.any(mask[in_2f])
-    # Same for [1.48, 1.52] (3*f_p ± 0.02).
-    in_3f = (f > 1.48) & (f < 1.52)
-    assert not np.any(mask[in_3f])
-    # A band well clear of both should be retained.
-    clear = (f > 0.6) & (f < 0.9)
-    assert np.all(mask[clear])
-
-
-# ---------------------------------------------------------------------------
-# 7. Fit-mask: Goda-effective range
-# ---------------------------------------------------------------------------
-
-
-def test_fit_mask_goda_range():
-    f = np.linspace(0.05, 3.0, 300)
-    k = solve_dispersion_array(f, depth=2.0)
-    X13 = 1.07
-    mask = build_fit_mask(f, k, X13=X13)
-    delta_l_over_L = k * X13 / (2.0 * np.pi)
-    assert np.all(mask == ((delta_l_over_L > 0.05) & (delta_l_over_L < 0.45)))
-
-
-# ---------------------------------------------------------------------------
-# 8. apply_cn_to_bins with identity config is a no-op
+# 6. apply_cn_to_bins with identity config is a no-op
 # ---------------------------------------------------------------------------
 
 
@@ -378,7 +337,7 @@ def test_apply_with_identity_config_is_identity():
 
 
 # ---------------------------------------------------------------------------
-# 9. load_cn_config validates convention block
+# 7. load_cn_config validates convention block
 # ---------------------------------------------------------------------------
 
 
@@ -405,7 +364,7 @@ def test_load_validates_convention(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# 10. measured_C is the inverse of evaluate_C on a clean field
+# 8. measured_C is the inverse of evaluate_C on a clean field
 # ---------------------------------------------------------------------------
 
 
@@ -427,7 +386,7 @@ def test_measured_C_inverts_evaluate_C():
 
 
 # ---------------------------------------------------------------------------
-# 11. save_cn_config round-trips through load_cn_config
+# 9. save_cn_config round-trips through load_cn_config
 # ---------------------------------------------------------------------------
 
 
@@ -448,15 +407,206 @@ def test_save_load_round_trip(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# 12. fit_probe_cn_parametric raises on empty mask
+# 10. fit_probe_cn_parametric raises on empty input
 # ---------------------------------------------------------------------------
 
 
-def test_fit_raises_on_empty_mask():
-    f = np.array([0.5, 1.0])
-    k = np.array([1.0, 2.0])
-    B1 = np.array([1 + 0j, 1 + 0j])
-    Bn = np.array([1 + 0j, 1 + 0j])
+def test_fit_raises_on_empty_input():
     with pytest.raises(ValueError, match="no bins"):
-        fit_probe_cn_parametric(f, k, B1, Bn, dx_nominal=0.5,
-                                fit_mask=np.array([False, False]))
+        fit_probe_cn_parametric(
+            np.array([]), np.array([]),
+            np.array([], dtype=complex), np.array([], dtype=complex),
+            dx_nominal=0.5,
+        )
+
+
+# ---------------------------------------------------------------------------
+# 11. Dynamic alpha: per-bin alpha(f) recovers a frequency-varying gain that
+#     a scalar cannot. Builds RW records where the injected gain α_n(f) varies
+#     linearly with f, then compares apply with alpha_mode='dynamic' vs 'scalar'.
+# ---------------------------------------------------------------------------
+
+
+def test_dynamic_alpha_recovers_varying_gain():
+    X12, X13, depth = 0.5, 1.07, 2.0
+    fs, duration, a_amp = 100.0, 40.0, 0.05
+    freqs = [0.30, 0.40, 0.50, 0.60, 0.65, 0.70, 0.75, 0.80]
+
+    # Frequency-varying gain on probe 2: alpha2(f) = 0.95 + 0.10·f
+    # (so 0.98 at 0.30 Hz → 1.03 at 0.80 Hz). Probe 3 stays constant for
+    # contrast — only probe 2 needs the dynamic table.
+    def alpha2_of(f: float) -> float:
+        return 0.95 + 0.10 * f
+
+    records = [
+        _record_one_freq(
+            float(f), a_amp, X12, X13,
+            err2=(alpha2_of(float(f)), 0.0, 0.0),
+            err3=(1.00, 0.0, 0.0),
+            fs=fs, duration=duration, depth=depth,
+        )
+        for f in freqs
+    ]
+    cfg = fit_cn_from_records(records, X12=X12, X13=X13)
+
+    # Scalar α2 sits at the mean across the band — nowhere near the per-f truth.
+    alpha2_scalar = cfg["wp2"]["alpha"]
+    alpha2_truth = np.array([alpha2_of(f) for f in freqs])
+    assert abs(alpha2_scalar - alpha2_truth.mean()) < 0.005
+
+    # per_bin table tracks the truth bin-by-bin.
+    pb_f = np.array(cfg["wp2"]["per_bin"]["f_Hz"])
+    pb_alpha = np.array(cfg["wp2"]["per_bin"]["alpha"])
+    truth_at_pb = np.array([alpha2_of(float(f)) for f in pb_f])
+    assert np.max(np.abs(pb_alpha - truth_at_pb)) < 0.005
+
+    # Now apply at one of the fitted frequencies. Build a synthetic measured
+    # bin: B2 = α2(f)·B1·exp(-i k X12). Dynamic should recover B1·exp(-i k X12)
+    # exactly; scalar leaves a residual gain of α2(f)/α2_scalar.
+    f_test = 0.30
+    k_test, _ = solve_dispersion(f_test, depth)
+    B1_test = np.array([1.0 + 0.0j])
+    B2_test = alpha2_of(f_test) * B1_test * np.exp(-1j * k_test * X12)
+    B3_test = 1.00 * B1_test * np.exp(-1j * k_test * X13)
+    f_arr = np.array([f_test])
+    k_arr = np.array([k_test])
+
+    _, B2_dyn, _ = apply_cn_to_bins(
+        B1_test, B2_test, B3_test, f_arr, k_arr, cfg, mode="amp",
+        alpha_mode="dynamic",
+    )
+    _, B2_sca, _ = apply_cn_to_bins(
+        B1_test, B2_test, B3_test, f_arr, k_arr, cfg, mode="amp",
+        alpha_mode="scalar",
+    )
+    truth_corrected = B1_test * np.exp(-1j * k_test * X12)
+    assert abs(B2_dyn[0] - truth_corrected[0]) < 5e-3 * abs(truth_corrected[0])
+    # Scalar leaves a residual gain of α2(f)/α2_scalar > 1 % at the band edge.
+    residual = abs(B2_sca[0] / truth_corrected[0])
+    expected_residual = alpha2_of(f_test) / alpha2_scalar
+    assert abs(residual - expected_residual) < 5e-3
+
+
+# ---------------------------------------------------------------------------
+# 12. Out-of-range fallback: dynamic α at a frequency outside [f_min, f_max]
+#     of per_bin must equal the scalar α (option B from the design discussion).
+# ---------------------------------------------------------------------------
+
+
+def test_dynamic_alpha_falls_back_to_scalar_outside_table():
+    f = np.array([0.5])
+    k = np.array([1.0])
+    table = {"f_Hz": [0.6, 0.8, 1.0], "alpha": [1.10, 1.20, 1.30]}
+    scalar = 0.97
+
+    # f below table -> scalar
+    out_lo = evaluate_C(
+        np.array([0.4]), k, scalar, 0.0, 0.0, mode="amp",
+        alpha_mode="dynamic", alpha_table=table,
+    )
+    assert np.isclose(out_lo[0].real, scalar)
+
+    # f above table -> scalar
+    out_hi = evaluate_C(
+        np.array([1.4]), k, scalar, 0.0, 0.0, mode="amp",
+        alpha_mode="dynamic", alpha_table=table,
+    )
+    assert np.isclose(out_hi[0].real, scalar)
+
+    # f at left endpoint -> exact table value (in-range)
+    out_edge = evaluate_C(
+        np.array([0.6]), k, scalar, 0.0, 0.0, mode="amp",
+        alpha_mode="dynamic", alpha_table=table,
+    )
+    assert np.isclose(out_edge[0].real, 1.10)
+
+    # f midway -> linear interpolation
+    out_mid = evaluate_C(
+        np.array([0.7]), k, scalar, 0.0, 0.0, mode="amp",
+        alpha_mode="dynamic", alpha_table=table,
+    )
+    assert np.isclose(out_mid[0].real, 1.15)
+
+    # Scalar mode ignores the table even when supplied.
+    out_scalar = evaluate_C(
+        f, k, scalar, 0.0, 0.0, mode="amp",
+        alpha_mode="scalar", alpha_table=table,
+    )
+    assert np.isclose(out_scalar[0].real, scalar)
+
+
+# ---------------------------------------------------------------------------
+# 13. fit_mask narrows the scalar α and is preserved across a re-fit via
+#     existing_fit_mask. The per_bin table is unaffected by the mask.
+# ---------------------------------------------------------------------------
+
+
+def test_fit_mask_narrows_scalar_and_round_trips(tmp_path):
+    X12, X13, depth = 0.5, 1.07, 2.0
+    fs, duration, a_amp = 100.0, 40.0, 0.05
+    freqs = [0.30, 0.40, 0.50, 0.60, 0.65, 0.70, 0.75, 0.80]
+
+    def alpha2_of(f: float) -> float:
+        return 0.95 + 0.10 * f
+
+    records = [
+        _record_one_freq(
+            float(f), a_amp, X12, X13,
+            err2=(alpha2_of(float(f)), 0.0, 0.0),
+            err3=(1.00, 0.0, 0.0),
+            fs=fs, duration=duration, depth=depth,
+        )
+        for f in freqs
+    ]
+    cfg_unmasked = fit_cn_from_records(records, X12=X12, X13=X13)
+
+    # Now re-fit with a tight mask of [0.65, 0.80] Hz — scalar α should rise
+    # toward the mean of α(f) on that subband, which is > the unmasked mean.
+    fm_existing = {"f_min_Hz": 0.65, "f_max_Hz": 0.80}
+    cfg_masked = fit_cn_from_records(
+        records, X12=X12, X13=X13, existing_fit_mask=fm_existing,
+    )
+
+    assert cfg_masked["fit_mask"]["f_min_Hz"] == 0.65
+    assert cfg_masked["fit_mask"]["f_max_Hz"] == 0.80
+    # Masked scalar = mean of α2 on [0.65, 0.80] ≈ mean([1.015, 1.02, 1.025, 1.03])
+    expected_masked_mean = np.mean([alpha2_of(f) for f in (0.65, 0.70, 0.75, 0.80)])
+    assert abs(cfg_masked["wp2"]["alpha"] - expected_masked_mean) < 0.005
+    assert cfg_masked["wp2"]["alpha"] > cfg_unmasked["wp2"]["alpha"]
+
+    # per_bin still includes every bin regardless of mask.
+    assert len(cfg_masked["wp2"]["per_bin"]["f_Hz"]) == len(freqs)
+
+    # Round-trip via JSON: save → load → fit_mask preserved.
+    p = tmp_path / "probes_refined.json"
+    save_cn_config(p, cfg_masked, fit_meta={"fitted_from_test_ids": ["X"]})
+    loaded = load_cn_config(p)
+    assert loaded["fit_mask"]["f_min_Hz"] == 0.65
+    assert loaded["fit_mask"]["f_max_Hz"] == 0.80
+
+    # And a follow-up fit reusing loaded["fit_mask"] yields the same scalar.
+    cfg_round = fit_cn_from_records(
+        records, X12=X12, X13=X13, existing_fit_mask=loaded["fit_mask"],
+    )
+    assert abs(cfg_round["wp2"]["alpha"] - cfg_masked["wp2"]["alpha"]) < 1e-9
+
+
+# ---------------------------------------------------------------------------
+# 14. Identity placeholder (no per_bin) → dynamic mode silently degrades to
+#     scalar; no NaN, no exception.
+# ---------------------------------------------------------------------------
+
+
+def test_identity_config_safe_under_dynamic_mode():
+    cfg = identity_cn_config()
+    f = np.array([0.5, 0.8, 1.2])
+    k = solve_dispersion_array(f, depth=2.0)
+    B1 = np.ones_like(f, dtype=complex)
+    B2 = np.ones_like(f, dtype=complex)
+    B3 = np.ones_like(f, dtype=complex)
+    out1, out2, out3 = apply_cn_to_bins(
+        B1, B2, B3, f, k, cfg, mode="both", alpha_mode="dynamic",
+    )
+    assert np.allclose(out1, B1)
+    assert np.allclose(out2, B2)
+    assert np.allclose(out3, B3)

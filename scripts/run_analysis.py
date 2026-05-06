@@ -32,6 +32,7 @@ from reflection_coefficient.io import (
     list_tests,
     load_probe_data,
     load_probes_config,
+    resolve_cn_alpha_mode,
     resolve_cn_apply,
     resolve_cn_config,
     resolve_cn_mode,
@@ -45,6 +46,7 @@ from reflection_coefficient.io import (
     resolve_recalibrate,
     resolve_tank_config,
     resolve_window,
+    save_cn_alpha_mode,
     save_cn_apply,
     save_cn_mode,
     save_drops,
@@ -194,10 +196,11 @@ def main() -> None:
     parser.add_argument(
         "--freq-source", choices=["bin", "target"], default=None,
         help=(
-            "Regular-wave only. 'bin' (default) picks the nearest FFT bin to "
-            "meta.f_Hz. 'target' evaluates a single-point DFT at exactly "
-            "meta.f_Hz, bypassing bin quantisation (reduces leakage bias on "
-            "short clips). Persisted when set."
+            "Regular-wave only. 'target' (default) evaluates a single-point "
+            "DFT at exactly meta.f_Hz, bypassing bin quantisation — assumes "
+            "the wave maker holds the commanded frequency across the test. "
+            "'bin' snaps to the nearest FFT bin (the legacy behaviour) and "
+            "is mainly useful as a diagnostic comparison. Persisted when set."
         ),
     )
     parser.add_argument(
@@ -246,6 +249,33 @@ def main() -> None:
             "'phase' (Δx + Δt only, Variant C), or 'both' (Variant D, full "
             "fit). Persisted when set (default: both). Ignored when "
             "--cn-apply is off."
+        ),
+    )
+    parser.add_argument(
+        "--cn-alpha-mode", choices=["scalar", "dynamic"], default=None,
+        help=(
+            "How alpha is evaluated when applying C_n. 'dynamic' (default) "
+            "linearly interpolates the per-bin alpha table stored in "
+            "probes_refined.json (per_bin.alpha) over frequency, falling "
+            "back to the scalar masked-mean alpha for bins outside the "
+            "table's frequency support. 'scalar' uses the masked-mean "
+            "alpha at every frequency (legacy behaviour). The scalar "
+            "fallback's frequency mask is editable in probes_refined.json "
+            "under fit_mask. Persisted when set; ignored when --cn-apply "
+            "is off or --cn-mode phase."
+        ),
+    )
+    parser.add_argument(
+        "--cn-fit-freq", choices=["bin", "target"], default="target",
+        help=(
+            "How to pick the per-record frequency at which C_n is fitted. "
+            "'target' (default) evaluates a single-point DFT at exactly "
+            "meta.f_Hz from rw.csv — leakage-free, independent of the noref "
+            "window length. 'bin' snaps to the nearest FFT bin (same as "
+            "--freq-source bin); on short noref windows df = 1/T is coarse "
+            "and the snapped frequency drifts from the target, which biases "
+            "the per-bin C_n^obs and corrupts the phase regression. Only "
+            "consulted when --cn-fit is on; not persisted."
         ),
     )
     parser.add_argument(
@@ -336,6 +366,10 @@ def _run(args) -> None:
         save_cn_mode(args.cn_mode)
     args.cn_mode = resolve_cn_mode(args.cn_mode)
 
+    if args.cn_alpha_mode is not None:
+        save_cn_alpha_mode(args.cn_alpha_mode)
+    args.cn_alpha_mode = resolve_cn_alpha_mode(args.cn_alpha_mode)
+
     tank_cfg = resolve_tank_config(args.tank_config)
     meta_dir = resolve_metadata_dir(args.metadata_dir)
     data_dir = resolve_data_dir(args.data_dir)
@@ -357,7 +391,7 @@ def _run(args) -> None:
         )
         print(f"  recalibrate   = {'on' if args.recalibrate else 'off'}")
         print(f"  cn_apply      = {'on' if args.cn_apply else 'off'} "
-              f"(mode: {args.cn_mode})")
+              f"(mode: {args.cn_mode}, alpha: {args.cn_alpha_mode})")
         print(f"  freq_source   = {args.freq_source}")
         print(f"  goda_pair     = {args.goda_pair}")
         return
@@ -438,9 +472,11 @@ def _run(args) -> None:
         f" | goda_pair={args.goda_pair}" if args.method == "goda" else ""
     )
     cn_txt = (
-        " | cn=fit"
+        f" | cn=fit(freq={args.cn_fit_freq})"
         if args.cn_fit
-        else f" | cn=on({args.cn_mode})" if args.cn_apply else ""
+        else f" | cn=on({args.cn_mode},α={args.cn_alpha_mode})"
+        if args.cn_apply
+        else ""
     )
     banner = (
         f" {SCHEME_LABELS[scheme]} | method={args.method}{pair_txt} "
@@ -520,6 +556,7 @@ def _run(args) -> None:
                 goda_pair=args.goda_pair,
                 cn_config=cn_config_data,
                 cn_mode=args.cn_mode,
+                cn_alpha_mode=args.cn_alpha_mode,
             )
         except Exception as exc:
             print(f"  !! {tid}: {exc}", file=sys.stderr)
@@ -537,13 +574,17 @@ def _run(args) -> None:
             print(f"[run_analysis] wrote {html_path}")
 
         # Accumulate FFT bins for the cn-fit branch (regular path only).
+        # The fit is decoupled from the persisted --freq-source: the noref
+        # window is short, so a bin-snapped frequency can sit far from the
+        # rw.csv target. Default cn_fit_freq='target' fixes the fit to the
+        # metadata frequency via a single-point DFT.
         if args.cn_fit and scheme == "rw":
             try:
                 f_used, k_val, b1, b2, b3 = extract_regular_bins(
                     t, eta1, eta2, eta3, meta,
                     head_drop_s=args.head_drop, tail_drop_s=args.tail_drop,
                     window_mode=args.window_mode,
-                    freq_source=args.freq_source,
+                    freq_source=args.cn_fit_freq,
                 )
             except Exception as exc:
                 print(f"  !! {tid} (cn_fit): {exc}", file=sys.stderr)
@@ -551,7 +592,6 @@ def _run(args) -> None:
                 cn_records.append({
                     "f": [f_used], "k": [k_val],
                     "B1": [b1], "B2": [b2], "B3": [b3],
-                    "f_peak_Hz": float(meta.f_Hz),
                 })
                 cn_test_ids.append(tid)
                 cn_geometry = (float(meta.X12_m), float(meta.X13_m))
@@ -578,8 +618,22 @@ def _run(args) -> None:
             )
             sys.exit(1)
         X12, X13 = cn_geometry
+        # Preserve any user-edited fit_mask in the existing JSON so a re-fit
+        # honours their narrowed band. If the file is absent or unreadable,
+        # fall back to "no mask" (data range) — the fit code defaults safely.
+        existing_fit_mask: dict | None = None
+        if cn_config_path.exists():
+            try:
+                existing_cfg = load_cn_config(cn_config_path)
+            except Exception:
+                existing_cfg = None
+            if existing_cfg is not None:
+                existing_fit_mask = existing_cfg.get("fit_mask")
         try:
-            cn_dict = fit_cn_from_records(cn_records, X12=X12, X13=X13)
+            cn_dict = fit_cn_from_records(
+                cn_records, X12=X12, X13=X13,
+                existing_fit_mask=existing_fit_mask,
+            )
         except Exception as exc:
             print(f"[run_analysis] --cn-fit failed: {exc}", file=sys.stderr)
             sys.exit(1)
@@ -587,24 +641,29 @@ def _run(args) -> None:
             "fitted_from_test_ids": cn_test_ids,
             "fitted_from_window_mode": args.window_mode,
             "fitted_with_recalibrate": bool(args.recalibrate),
-            "fit_mask": {
-                "harmonic_halfwidth_Hz": 0.02,
-                "delta_l_over_L_lo": 0.05,
-                "delta_l_over_L_hi": 0.45,
-            },
+            "fitted_freq_source": args.cn_fit_freq,
             "geometry": {"X12_m": X12, "X13_m": X13},
             "n_records": len(cn_records),
         }
         save_cn_config(cn_config_path, cn_dict, fit_meta=fit_meta)
         print(f"[run_analysis] wrote {cn_config_path}")
+        fm = cn_dict.get("fit_mask", {})
+        if fm:
+            preserved = " (preserved from existing file)" if existing_fit_mask else ""
+            print(
+                f"  [cn_fit] scalar-α mask: "
+                f"f∈[{fm.get('f_min_Hz', '?'):.4f}, "
+                f"{fm.get('f_max_Hz', '?'):.4f}] Hz{preserved}"
+            )
         for key in ("wp2", "wp3"):
             entry = cn_dict[key]
             d = entry.get("fit_diagnostics", {})
             print(
-                f"  [cn_fit] {key} α={entry['alpha']:.4f} "
+                f"  [cn_fit] {key} α_scalar={entry['alpha']:.4f} "
                 f"Δx={entry['delta_x_m']*1000:+.2f} mm "
                 f"Δt={entry['delta_t_s']*1e6:+.1f} µs "
                 f"(n_bins={d.get('n_bins_used', '?')}, "
+                f"in_mask={d.get('n_bins_in_mask', '?')}, "
                 f"residual={d.get('residual_rms_rad', float('nan')):.3f} rad)"
             )
 

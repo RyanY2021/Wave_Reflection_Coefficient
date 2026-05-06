@@ -36,6 +36,7 @@ MethodName = Literal["goda", "least_squares"]
 WindowMode = Literal["canonical", "noref"]
 FreqSource = Literal["bin", "target"]
 GodaPair = Literal["13", "12", "23"]
+CnAlphaMode = Literal["scalar", "dynamic"]
 
 
 def _goda_pair_spacing(pair: GodaPair, X12: float, X13: float) -> float:
@@ -131,11 +132,12 @@ class RegularResult:
     t_analysis_start_s: float = 0.0
     t_analysis_end_s: float = 0.0
     window_mode: str = "canonical"
-    freq_source: str = "bin"
+    freq_source: str = "target"
     f_target_Hz: float = 0.0
     goda_pair: str = "13"
     cn_applied: bool = False
     cn_mode: str = "both"
+    cn_alpha_mode: str = "dynamic"
 
 
 @dataclass
@@ -157,6 +159,7 @@ class IrregularResult:
     diagnostics: dict = field(default_factory=dict)
     cn_applied: bool = False
     cn_mode: str = "both"
+    cn_alpha_mode: str = "dynamic"
 
 
 # ---------------------------------------------------------------------------
@@ -174,10 +177,11 @@ def analyse_regular(
     head_drop_s: float = 0.0,
     tail_drop_s: float = 0.0,
     window_mode: WindowMode = "canonical",
-    freq_source: FreqSource = "bin",
+    freq_source: FreqSource = "target",
     goda_pair: GodaPair = "13",
     cn_config: dict | None = None,
     cn_mode: str = "both",
+    cn_alpha_mode: CnAlphaMode = "dynamic",
 ) -> RegularResult:
     if meta.f_Hz is None:
         raise ValueError(f"{meta.test_id}: regular-wave analysis requires meta.f_Hz")
@@ -283,6 +287,7 @@ def analyse_regular(
         b1_arr, b2_arr, b3_arr = apply_cn_to_bins(
             np.array([b1]), np.array([b2]), np.array([b3]),
             f_arr, k_arr_cn, cn_config, mode=cn_mode,
+            alpha_mode=cn_alpha_mode,
         )
         b1, b2, b3 = complex(b1_arr[0]), complex(b2_arr[0]), complex(b3_arr[0])
 
@@ -344,6 +349,7 @@ def analyse_regular(
         goda_pair=goda_pair,
         cn_applied=cn_config is not None,
         cn_mode=cn_mode,
+        cn_alpha_mode=cn_alpha_mode,
     )
 
 
@@ -357,7 +363,7 @@ def extract_regular_bins(
     head_drop_s: float = 0.0,
     tail_drop_s: float = 0.0,
     window_mode: WindowMode = "noref",
-    freq_source: FreqSource = "bin",
+    freq_source: FreqSource = "target",
 ) -> tuple[float, float, complex, complex, complex]:
     """Return ``(f_used, k_val, b1, b2, b3)`` for one regular-wave record.
 
@@ -475,6 +481,7 @@ def analyse_irregular(
     goda_pair: GodaPair = "13",
     cn_config: dict | None = None,
     cn_mode: str = "both",
+    cn_alpha_mode: CnAlphaMode = "dynamic",
 ) -> IrregularResult:
     """Irregular-wave reflection analysis (white-noise or JONSWAP).
 
@@ -610,6 +617,7 @@ def analyse_irregular(
     if cn_config is not None:
         B1, B2, B3 = apply_cn_to_bins(
             B1, B2, B3, f_pos, k_arr, cn_config, mode=cn_mode,
+            alpha_mode=cn_alpha_mode,
         )
 
     if method == "goda":
@@ -695,6 +703,7 @@ def analyse_irregular(
         "goda_pair": goda_pair if method == "goda" else None,
         "cn_applied": cn_config is not None,
         "cn_mode": cn_mode,
+        "cn_alpha_mode": cn_alpha_mode,
     }
 
     return IrregularResult(
@@ -715,6 +724,7 @@ def analyse_irregular(
         diagnostics=diagnostics,
         cn_applied=cn_config is not None,
         cn_mode=cn_mode,
+        cn_alpha_mode=cn_alpha_mode,
     )
 
 
@@ -730,17 +740,19 @@ def analyse(
     head_drop_s: float = 0.0,
     tail_drop_s: float = 0.0,
     window_mode: WindowMode = "canonical",
-    freq_source: FreqSource = "bin",
+    freq_source: FreqSource = "target",
     goda_pair: GodaPair = "13",
     cn_config: dict | None = None,
     cn_mode: str = "both",
+    cn_alpha_mode: CnAlphaMode = "dynamic",
 ) -> RegularResult | IrregularResult:
     """Dispatch to the regular or irregular path based on ``meta.campaign``.
 
     ``freq_source`` is a regular-wave-only switch; ignored for wn/js.
     ``goda_pair`` only takes effect when ``method == "goda"``.
     ``cn_config`` (if not None) divides the FFT bins by per-probe $C_n(f)$
-    before separation; ``cn_mode`` selects amp / phase / both.
+    before separation; ``cn_mode`` selects amp / phase / both, and
+    ``cn_alpha_mode`` selects scalar α vs frequency-interpolated α.
     """
     if meta.campaign == "rw":
         return analyse_regular(
@@ -751,6 +763,7 @@ def analyse(
             goda_pair=goda_pair,
             cn_config=cn_config,
             cn_mode=cn_mode,
+            cn_alpha_mode=cn_alpha_mode,
         )
     return analyse_irregular(
         t, eta1, eta2, eta3, meta, method=method,
@@ -760,4 +773,5 @@ def analyse(
         goda_pair=goda_pair,
         cn_config=cn_config,
         cn_mode=cn_mode,
+        cn_alpha_mode=cn_alpha_mode,
     )
